@@ -1,0 +1,5 @@
+prune pyembed
+prune build
+prune target
+prune .uv_cache
+prune .venv

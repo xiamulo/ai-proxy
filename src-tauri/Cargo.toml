@@ -1,0 +1,41 @@
+[package]
+name = "mtga-tauri"
+version = "2.6.0"
+description = "MTGA 的 Tauri App"
+authors = ["BiFangKNT"]
+license = "AGPL-3.0-only"
+repository = "."
+edition = "2024"
+rust-version = "1.85.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+pyo3 = "0.25"
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-pytauri = { version = "0.8" }
+tauri-plugin-shell = "2"
+
+[profile.bundle-dev]
+inherits = "dev"
+incremental = true # 以较小的步骤编译您的二进制文件。
+
+[profile.bundle-release]
+inherits = "release"
+codegen-units = 1 # 允许 LLVM 执行更好的优化。
+lto = true # 启用链接时优化。
+opt-level = 3 # 优先考虑小的二进制文件大小。如果您更喜欢速度，请使用 `3`。
+panic = "abort" # 通过禁用 panic 处理程序来提高性能。
+#panic = "unwind"
+strip = true # 确保移除调试符号。

@@ -1,0 +1,43 @@
+name: 🍎 macOS 安装包无法打开/“已损坏”
+description: 仅针对 macOS 包签名/隔离导致的阻止打开、损坏提示等问题
+title: "[macOS] 包已损坏/无法打开 - 简要描述"
+labels: ["platform:macOS"]
+body:
+  - type: dropdown
+    id: arch
+    attributes:
+      label: 设备架构
+      options: [Apple Silicon (arm64), Intel (x86_64)]
+    validations:
+      required: true
+  - type: textarea
+    id: sysinfo
+    attributes:
+      label: 系统与内核信息（务必粘贴命令输出）
+      description: 请粘贴 `uname -mprs` 的完整输出
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: file_name
+    attributes:
+      label: 安装包文件名或应用内显示的版本
+      placeholder: MTGA_GUI-vX.Y.Z-aarch64.dmg / 应用内版本号
+    validations:
+      required: true
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: 你已尝试
+      description: 如果不知道怎么做，可点击“解决方案”快速查看步骤
+      options:
+        - label: 我已按“[解决方案](https://github.com/BiFangKNT/mtga?tab=readme-ov-file#macos-%E8%A7%A3%E5%86%B3-%E5%8C%85%E5%B7%B2%E6%8D%9F%E5%9D%8F-%E9%97%AE%E9%A2%98)”处理
+          required: true
+        - label: 解除隔离属性（例如 `xattr -dr com.apple.quarantine /Applications/MTGA.app`）
+          required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: 具体报错信息与截图
+      placeholder: 请包含系统弹窗、控制台输出等
+      render: shell

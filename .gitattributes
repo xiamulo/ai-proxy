@@ -1,0 +1,43 @@
+# 默认文本使用 LF，避免跨平台换行差异
+* text eol=lf
+
+# Windows 批处理 / PowerShell 保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# 常见脚本与配置强制 LF
+*.sh text eol=lf
+*.py text eol=lf
+*.pyw text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 二进制资产不执行行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.svg binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.p12 binary
+*.pfx binary
+*.cer binary
+*.der binary
+*.db binary
+*.zip binary
+*.gz binary
+*.bz2 binary
+*.7z binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary

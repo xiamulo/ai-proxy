@@ -1,0 +1,809 @@
+name: 🚀 构建和发布版本(TAURI)
+on:
+  push:
+    tags:
+      - "v2.*.*-*" # 预发布版标签格式：v2.0.0-beta.1, v2.0.0-rc.1
+      - "v2.*.*" # 正式版标签：v2.0.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          版本号（例如：2.0.0-beta.1）。手动触发只支持更新已存在 tag；
+          新 tag 请用 git-flow-next 创建 release 分支并通过 `pnpm release:push` 推送。
+        required: false
+        default: ""
+      release_type:
+        description: "发布类型"
+        required: true
+        default: "prerelease"
+        type: choice
+        options:
+          - prerelease
+          - release
+      start_commit:
+        description: >-
+          起始提交哈希（示例：
+          1234567890abcdef1234567890abcdef12345678）
+        required: false
+        default: ""
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  preflight-auth:
+    name: 🔐 预检发布凭据
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔍 校验 CI_DEPLOY_KEY 与目标分支可访问性
+        env:
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_DEPLOY_KEY:-}" ]; then
+            echo "❌ 缺少 secrets.CI_DEPLOY_KEY，无法执行发布回写推送"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${CI_DEPLOY_KEY}" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/ci_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+          remote="git@github.com:${GITHUB_REPOSITORY}.git"
+
+          for branch in dev tauri; do
+            if ! git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null; then
+              echo "❌ CI_DEPLOY_KEY 无法访问分支 ${branch}，请确认 deploy key 已配置写权限并加入规则集 bypass"
+              exit 1
+            fi
+          done
+
+          echo "✅ CI_DEPLOY_KEY 校验通过，可访问目标分支"
+
+  prepare-version:
+    name: 🧮 计算版本信息
+    needs: preflight-auth
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_type: ${{ steps.version.outputs.release_type }}
+      release_label: ${{ steps.version.outputs.release_label }}
+      release_name: ${{ steps.version.outputs.release_name }}
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: ⚙️ 获取版本信息
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.version }}" ]; then
+              VERSION="${{ github.event.inputs.version }}"
+            elif command -v python3 >/dev/null 2>&1; then
+              VERSION=$(python3 -c 'exec("import json\nfrom pathlib import Path\n\ntauri_conf = Path(\"src-tauri/tauri.conf.json\")\ndata = json.loads(tauri_conf.read_text(encoding=\"utf-8\"))\nversion = data.get(\"version\")\nif not version:\n    raise SystemExit(\"Missing version in tauri.conf.json\")\nprint(version)\n")')
+              echo "ℹ️ 未提供版本号，回退到 src-tauri/tauri.conf.json 中的 $VERSION"
+            else
+              echo "❌ 无法解析 src-tauri/tauri.conf.json，请在 workflow_dispatch 中提供版本号"
+              exit 1
+            fi
+            TAG_NAME="v$VERSION"
+            RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            if [[ "${TAG_NAME}" == *"-"* ]]; then
+              RELEASE_TYPE="prerelease"
+            else
+              RELEASE_TYPE="release"
+            fi
+          fi
+
+          if [ "$RELEASE_TYPE" = "release" ]; then
+            RELEASE_LABEL="正式发布版"
+          else
+            RELEASE_LABEL="预发布版"
+          fi
+          RELEASE_NAME="v${VERSION}"
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "release_label=$RELEASE_LABEL" >> $GITHUB_OUTPUT
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+
+      - name: 🔎 校验手动重发标签存在
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          if ! git rev-parse "$TAG_NAME^{commit}" >/dev/null 2>&1; then
+            echo "❌ workflow_dispatch 仅支持重打已存在标签: $TAG_NAME"
+            echo "请先创建并推送该标签后再重发。"
+            exit 1
+          fi
+          echo "✅ 目标标签存在：$TAG_NAME，后续构建将固定在该标签提交上"
+
+  build-macos:
+    name: 🍎 构建 macOS
+    needs: prepare-version
+    runs-on: ${{ matrix.runner }}
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.uv_cache
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAURI_BUNDLER_DEBUG: "true"
+      RUST_LOG: tauri_bundler=debug
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            python_asset_regex: x86_64-apple-darwin
+          - arch: arm64
+            runner: macos-latest
+            python_asset_regex: aarch64-apple-darwin
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', needs.prepare-version.outputs.tag_name) || github.ref }}
+          fetch-depth: 0
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🟢 设置 Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: 🔧 启用 Corepack
+        id: pnpm-store
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          pnpm --version
+          echo "pnpm_store_path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: 💾 缓存 pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.pnpm_store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: 🦀 设置 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 🧰 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+          shared-key: tauri-${{ runner.os }}-${{ matrix.arch }}
+
+      - name: 🔍 调试 uv.lock
+        run: |
+          pwd
+          ls -l python-src/uv.lock || echo "python-src/uv.lock 不存在"
+          head -5 python-src/uv.lock || true
+
+      - name: 🧮 计算 uv.lock 哈希
+        id: uv-lock-hash
+        run: |
+          if [ -f python-src/uv.lock ]; then
+            echo "hash=$(shasum -a 256 python-src/uv.lock | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "hash=missing" >> "$GITHUB_OUTPUT"
+            echo "⚠️ uv.lock 不存在，缓存 key 使用 missing"
+          fi
+
+      - name: 💾 缓存 uv 依赖
+        uses: actions/cache@v5
+        with:
+          path: |
+            python-src/.venv
+            .uv_cache
+            ~/.local/bin/uv
+            ~/.local/bin/uvx
+          key: ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-${{ matrix.arch }}-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-${{ matrix.arch }}-
+
+      - name: 📦 安装 uv
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          # 安装脚本内部会从 GitHub 下载 release 资源，网络抖动时可能打印 curl 错误但最终退出 0，
+          # 因此这里以 "uv 是否可用" 作为成功判定并重试，避免后续出现 uv: command not found。
+          for i in 1 2 3; do
+            if command -v uv >/dev/null 2>&1; then
+              break
+            fi
+            echo "🔁 尝试安装 uv（第 $i 次）..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh || true
+            sleep $((i * 5))
+          done
+
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "❌ uv 安装失败（多次重试后仍不可用）"
+            exit 1
+          fi
+
+          uv --version
+
+      - name: 🔧 同步 Python 依赖
+        run: uv sync --project .
+        working-directory: python-src
+
+      - name: 📦 安装前端依赖
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: 📥 准备 pyembed Python
+        run: |
+          set -euo pipefail
+          PYEMBED_DIR="src-tauri/pyembed"
+          mkdir -p "$PYEMBED_DIR"
+          ASSET_URL=$(gh api /repos/astral-sh/python-build-standalone/releases/latest \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --jq '.assets[] | select(.name | test("cpython-3\\.13\\..*\\+.*-'${{ matrix.python_asset_regex }}'-install_only_stripped\\.tar\\.gz")) | .browser_download_url' \
+            | head -n 1)
+          if [ -z "$ASSET_URL" ]; then
+            echo "❌ 未找到匹配的 Python 构建产物"
+            exit 1
+          fi
+          echo "⬇️ 下载: $ASSET_URL"
+          curl -L "$ASSET_URL" -o /tmp/python-standalone.tar.gz
+          tar -xzf /tmp/python-standalone.tar.gz -C "$PYEMBED_DIR"
+
+      - name: 🛠️ 安装 Xcode Command Line Tools
+        run: |
+          sudo xcode-select --install || true
+          # 等待安装完成或跳过如果已安装
+          while ! xcode-select -p &>/dev/null; do
+            echo "等待 Xcode Command Line Tools 安装..."
+            sleep 10
+          done
+
+      - name: 🧰 设置 Xcode 工具路径
+        run: |
+          set -euo pipefail
+          DEV_DIR=$(xcode-select -p)
+          echo "DEV_DIR=$DEV_DIR"
+          echo "$DEV_DIR/usr/bin" >> "$GITHUB_PATH"
+          which SetFile || true
+
+      - name: 🧩 安装 pytauri 依赖
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            echo "🔁 安装 pytauri 依赖（第 $i 次）..."
+            if pnpm pytauri:install:mac; then
+              exit 0
+            fi
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 10))
+            fi
+          done
+          echo "❌ 安装 pytauri 依赖失败（重试 3 次后仍失败）"
+          exit 1
+        working-directory: .
+
+      - name: ✂️ 裁剪 pyembed 运行时
+        run: pnpm pyembed:prune
+        working-directory: .
+
+      - name: 🧱 打包 Tauri
+        run: pnpm tauri:bundle:mac:ci
+        working-directory: .
+
+      - name: 🏷️ 重命名 macOS 安装包
+        run: |
+          set -euo pipefail
+          VERSION_RAW="${{ needs.prepare-version.outputs.version }}"
+          VERSION_WITH_V="v${VERSION_RAW}"
+          PLATFORM_TAG="apple"
+          for file in src-tauri/target/bundle-release/bundle/dmg/*.dmg; do
+            [ -e "$file" ] || continue
+            base=$(basename "$file")
+            if [[ "$base" == *"_${VERSION_RAW}_"* ]]; then
+              new="${base/_${VERSION_RAW}_/_${VERSION_WITH_V}_${PLATFORM_TAG}_}"
+              if [ "$new" != "$base" ]; then
+                mv "$file" "$(dirname "$file")/$new"
+              fi
+            fi
+          done
+
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.arch }}-artifacts
+          path: |
+            src-tauri/target/bundle-release/bundle/dmg/*.dmg
+          retention-days: 7
+
+  build-windows:
+    name: 🪟 构建 Windows
+    needs: prepare-version
+    runs-on: windows-latest
+    env:
+      UV_CACHE_DIR: "${{ github.workspace }}\\.uv_cache"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', needs.prepare-version.outputs.tag_name) || github.ref }}
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🟢 设置 Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: 🔧 启用 Corepack
+        id: pnpm-store
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          pnpm --version
+          $store = pnpm store path --silent
+          "pnpm_store_path=$store" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 💾 缓存 pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.pnpm_store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: 🦀 设置 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 🧰 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+          shared-key: tauri-${{ runner.os }}-x64
+
+      - name: 🔍 调试 uv.lock
+        run: |
+          Get-Location
+          if (Test-Path python-src/uv.lock) {
+            Get-Item python-src/uv.lock | Format-List FullName,Length
+            Get-Content python-src/uv.lock -TotalCount 5
+          } else {
+            Write-Host "python-src/uv.lock 不存在"
+          }
+
+      - name: 🧮 计算 uv.lock 哈希
+        id: uv-lock-hash
+        run: |
+          if (Test-Path python-src/uv.lock) {
+            $hash = (Get-FileHash python-src/uv.lock -Algorithm SHA256).Hash
+          } else {
+            $hash = "missing"
+            Write-Host "⚠️ uv.lock 不存在，缓存 key 使用 missing"
+          }
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 💾 缓存 uv 依赖
+        uses: actions/cache@v5
+        with:
+          path: |
+            python-src/.venv
+            .uv_cache
+            ${{ env.USERPROFILE }}\.local\bin\uv.exe
+            ${{ env.USERPROFILE }}\.local\bin\uvx.exe
+          key: ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-win-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-win-
+
+      - name: 📦 安装 uv
+        run: |
+          $ErrorActionPreference = "Stop"
+          $uvBinDir = Join-Path $env:USERPROFILE ".local\\bin"
+          $env:PATH = "$uvBinDir;$env:PATH"
+          $uvBinDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          for ($i = 1; $i -le 3; $i++) {
+            if (Get-Command uv -ErrorAction SilentlyContinue) {
+              break
+            }
+            Write-Host "🔁 尝试安装 uv（第 $i 次）..."
+            try {
+              Invoke-WebRequest -Uri "https://astral.sh/uv/install.ps1" -OutFile "install.ps1"
+              ./install.ps1
+            } catch {
+              Write-Host "⚠️ uv 安装脚本执行失败: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (5 * $i)
+          }
+
+          if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+            throw "uv 安装失败（多次重试后仍不可用）"
+          }
+
+          uv --version
+
+      - name: 🔧 同步 Python 依赖
+        run: uv sync --project .
+        working-directory: python-src
+
+      - name: 📦 安装前端依赖
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: 📥 准备 pyembed Python
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pyembedDir = "src-tauri/pyembed"
+          New-Item -ItemType Directory -Path $pyembedDir -Force | Out-Null
+          $assetUrl = gh api /repos/astral-sh/python-build-standalone/releases/latest `
+            -H "Accept: application/vnd.github+json" `
+            -H "X-GitHub-Api-Version: 2022-11-28" `
+            --jq '.assets[] | select(.name | test("cpython-3\\.13\\..*\\+.*-x86_64-pc-windows-msvc-install_only_stripped\\.tar\\.gz")) | .browser_download_url' |
+            Select-Object -First 1
+          if (-not $assetUrl) { throw "❌ 未找到匹配的 Python 构建产物" }
+          $archivePath = Join-Path $pyembedDir "python-standalone.tar.gz"
+          Write-Host "⬇️ 下载: $assetUrl"
+          Invoke-WebRequest -Uri $assetUrl -OutFile $archivePath
+          tar -xzf $archivePath -C $pyembedDir
+
+      - name: 🧩 安装 pytauri 依赖
+        run: |
+          $ErrorActionPreference = "Stop"
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "🔁 安装 pytauri 依赖（第 $i 次）..."
+            try {
+              & pnpm pytauri:install:win
+              if ($LASTEXITCODE -eq 0) {
+                exit 0
+              }
+              Write-Warning "第 $i 次安装失败，退出码：$LASTEXITCODE"
+            } catch {
+              Write-Warning "第 $i 次安装执行失败：$($_.Exception.Message)"
+            }
+            if ($i -lt 3) {
+              Start-Sleep -Seconds ($i * 10)
+            }
+          }
+          throw "❌ 安装 pytauri 依赖失败（重试 3 次后仍失败）"
+        working-directory: .
+
+      - name: ✂️ 裁剪 pyembed 运行时
+        run: pnpm pyembed:prune
+        working-directory: .
+
+      - name: 🧱 打包 Tauri
+        run: pnpm tauri:bundle:win:ci
+        working-directory: .
+
+      - name: 🏷️ 重命名 Windows 安装包
+        run: |
+          $versionRaw = "${{ needs.prepare-version.outputs.version }}"
+          $versionWithV = "v$versionRaw"
+          $tag = "windows"
+          $escaped = [regex]::Escape("_${versionRaw}_")
+          Get-ChildItem "src-tauri/target/bundle-release/bundle/nsis" -Filter *.exe | ForEach-Object {
+            $name = $_.Name
+            if ($name -match $escaped) {
+              $newName = $name -replace $escaped, "_${versionWithV}_${tag}_"
+              if ($newName -ne $name) {
+                Rename-Item -Path $_.FullName -NewName $newName
+              }
+            }
+          }
+
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-artifacts
+          path: |
+            src-tauri/target/bundle-release/bundle/nsis/*.exe
+          retention-days: 7
+
+  create-release:
+    name: 🚀 创建 GitHub 发布
+    needs: [prepare-version, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', needs.prepare-version.outputs.tag_name) || github.ref }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+      - name: 📥 下载所有构建产物
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: 📋 列出构建产物
+        run: |
+          echo "🗂️ 构建产物列表:"
+          find artifacts -type f \( -name "*.app" -o -name "*.dmg" -o -name "*.exe" \) | sort
+
+      - name: 🧭 设置发布环境变量
+        run: |
+          echo "VERSION=${{ needs.prepare-version.outputs.version }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.prepare-version.outputs.tag_name }}" >> $GITHUB_ENV
+          echo "RELEASE_TYPE=${{ needs.prepare-version.outputs.release_type }}" >> $GITHUB_ENV
+          echo "RELEASE_LABEL=${{ needs.prepare-version.outputs.release_label }}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${{ needs.prepare-version.outputs.release_name }}" >> $GITHUB_ENV
+
+      - name: 🧮 解析发布范围（start_commit 优先，否则上一正式版 -> 当前提交）
+        run: |
+          set -euo pipefail
+
+          START_COMMIT_INPUT="${{ github.event.inputs.start_commit || '' }}"
+          CURRENT_TAG="$TAG_NAME"
+          TARGET_COMMIT=$(git rev-parse "$TAG_NAME^{commit}" 2>/dev/null || git rev-parse "${GITHUB_SHA}")
+
+          PREV_STABLE_TAG=""
+          START_COMMIT_SOURCE="workflow_dispatch.start_commit"
+          if [ -n "$START_COMMIT_INPUT" ]; then
+            if ! git cat-file -e "$START_COMMIT_INPUT^{commit}" 2>/dev/null; then
+              echo "❌ start_commit 不存在或不可解析为提交: $START_COMMIT_INPUT"
+              exit 1
+            fi
+            FROM_COMMIT=$(git rev-parse "$START_COMMIT_INPUT^{commit}")
+          else
+            START_COMMIT_SOURCE="previous-stable-tag"
+            PREV_STABLE_TAG=$(git tag -l 'v*' --sort=-version:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -Fvx "$CURRENT_TAG" \
+              | head -n 1)
+
+            if [ -z "$PREV_STABLE_TAG" ]; then
+              echo "❌ 未找到上一正式版标签，且未提供 start_commit"
+              exit 1
+            fi
+
+            FROM_COMMIT=$(git rev-parse "$PREV_STABLE_TAG^{commit}")
+          fi
+
+          if ! git merge-base --is-ancestor "$FROM_COMMIT" "$TARGET_COMMIT"; then
+            echo "❌ 起始提交不在目标提交历史中: $FROM_COMMIT -> $TARGET_COMMIT"
+            exit 1
+          fi
+
+          CHANGELOG_RANGE="${FROM_COMMIT}..${TARGET_COMMIT}"
+          if [ -n "$START_COMMIT_INPUT" ]; then
+            # 双点范围不包含起始提交；手动 start_commit 时通过父提交把起始提交纳入范围
+            if git rev-parse "${FROM_COMMIT}^" >/dev/null 2>&1; then
+              CHANGELOG_RANGE="$(git rev-parse "${FROM_COMMIT}^")..${TARGET_COMMIT}"
+            else
+              echo "⚠️ start_commit 没有父提交，范围将不包含起始提交本身"
+            fi
+          fi
+
+          echo "ℹ️ 发布说明范围: $CHANGELOG_RANGE (source: $START_COMMIT_SOURCE, from: $FROM_COMMIT, prev_stable: ${PREV_STABLE_TAG:-none})"
+          echo "PREV_STABLE_TAG=$PREV_STABLE_TAG" >> "$GITHUB_ENV"
+          echo "FROM_COMMIT=$FROM_COMMIT" >> "$GITHUB_ENV"
+          echo "TARGET_COMMIT=$TARGET_COMMIT" >> "$GITHUB_ENV"
+          echo "CHANGELOG_RANGE=$CHANGELOG_RANGE" >> "$GITHUB_ENV"
+
+      - name: 🧩 计算 git-cliff 参数
+        run: |
+          set -euo pipefail
+          START_COMMIT_INPUT="${{ github.event.inputs.start_commit || '' }}"
+
+          build_ignore_tags_arg() {
+            local tag_pattern="$1"
+            local excluded_tag="$2"
+            local ignore_pattern=""
+
+            mapfile -t matched_tags < <(
+              {
+                while read -r commit; do
+                  git tag --points-at "$commit"
+                done < <(git rev-list "$CHANGELOG_RANGE")
+              } | grep -E "$tag_pattern" | grep -Fvx "$excluded_tag" | sort -u || true
+            )
+
+            if [ "${#matched_tags[@]}" -eq 0 ]; then
+              return 0
+            fi
+
+            ignore_pattern=$(
+              printf '%s\n' "${matched_tags[@]}" \
+                | sed -E 's/[][(){}.^$*+?|\\]/\\&/g' \
+                | paste -sd'|' -
+            )
+
+            if [ -n "$ignore_pattern" ]; then
+              local shell_escaped_pattern
+              printf -v shell_escaped_pattern '%q' "^(${ignore_pattern})$"
+              printf ' --ignore-tags %s' "$shell_escaped_pattern"
+            fi
+          }
+
+          RANGE_TAG_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$'
+          if [ "$RELEASE_TYPE" = "release" ]; then
+            # 正式版保留范围内全部提交，但只输出当前正式版这一节。
+            IGNORE_TAGS_ARG=$(build_ignore_tags_arg "$RANGE_TAG_PATTERN" "$TAG_NAME")
+            echo "GIT_CLIFF_ARGS=--tag ${TAG_NAME}${IGNORE_TAGS_ARG} --strip all ${CHANGELOG_RANGE}" >> "$GITHUB_ENV"
+          elif [ -n "$START_COMMIT_INPUT" ]; then
+            # 手动重跑预发布且指定起点时，保留范围内全部提交，但只输出当前预发布这一节。
+            IGNORE_TAGS_ARG=$(build_ignore_tags_arg "$RANGE_TAG_PATTERN" "$TAG_NAME")
+            echo "GIT_CLIFF_ARGS=--tag ${TAG_NAME}${IGNORE_TAGS_ARG} --strip all ${CHANGELOG_RANGE}" >> "$GITHUB_ENV"
+          else
+            # 预发布只生成当前 tag 自己的说明，避免把同版本旧后缀版一起带上。
+            echo "GIT_CLIFF_ARGS=--current --tag ${TAG_NAME} --strip all" >> "$GITHUB_ENV"
+          fi
+
+      - name: 📝 使用 git-cliff 生成发布说明
+        uses: orhun/git-cliff-action@v4
+        with:
+          version: latest
+          config: cliff.toml
+          args: ${{ env.GIT_CLIFF_ARGS }}
+        env:
+          OUTPUT: release_notes.md
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔎 检查发布说明
+        run: |
+          set -euo pipefail
+          if [ ! -s release_notes.md ]; then
+            echo "❌ release_notes.md 为空，停止发布"
+            exit 1
+          fi
+
+      - name: 🏷️ 统一发布说明标题为当前标签
+        run: |
+          set -euo pipefail
+          if grep -Eq '^## [^ ]+ - ' release_notes.md; then
+            sed -E "1s|^## [^ ]+ - |## ${TAG_NAME} - |" release_notes.md > release_notes.tmp
+            mv release_notes.tmp release_notes.md
+          else
+            {
+              echo "## ${TAG_NAME} - $(date -u +%Y-%m-%d)"
+              echo
+              cat release_notes.md
+            } > release_notes.tmp
+            mv release_notes.tmp release_notes.md
+          fi
+
+      - name: 🔎 预览发布说明
+        run: |
+          set -euo pipefail
+          echo "📝 release_notes.md 预览:"
+          cat release_notes.md
+
+      - name: 🧾 回写 CHANGELOG.md 并同步 dev -> tauri
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ℹ️ 非正式版标签（$TAG_NAME），跳过 CHANGELOG 回写与分支同步"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          rewrite_changelog() {
+            if [ -f CHANGELOG.md ]; then
+              # 幂等：重跑当前正式版时先移除同版本章节，并清理历史预发布章节。
+              awk -v tag="$TAG_NAME" '
+                  BEGIN { skip = 0 }
+                  NR <= 2 { next }
+                  {
+                    if ($1 == "##") {
+                      if (skip == 1) {
+                        skip = 0
+                      }
+                      # CHANGELOG 只保留正式版章节；重跑当前版本时也先移除旧章节。
+                      if ($2 == tag || $2 ~ /^v[0-9]+\.[0-9]+\.[0-9]+-/) {
+                        skip = 1
+                        next
+                      }
+                  }
+                  if (skip == 0) {
+                    print
+                  }
+                }
+              ' CHANGELOG.md > .changelog_rest.md
+            else
+              : > .changelog_rest.md
+            fi
+
+            {
+              echo "# CHANGELOG"
+              echo
+              cat release_notes.md
+              echo
+              cat .changelog_rest.md
+            } > CHANGELOG.md
+          }
+
+          git fetch origin dev tauri
+
+          # 先在 dev 回写并推送 CHANGELOG
+          git checkout -B dev origin/dev
+          rewrite_changelog
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "ℹ️ dev 分支 CHANGELOG 无变更，跳过 dev 提交"
+          else
+            git commit -m "docs(changelog): update for ${TAG_NAME}"
+            git push origin dev
+          fi
+
+          # 再切到 tauri，合并 dev 后推送
+          # 规则集约束了推送权限，触发本action时，tauri和dev的HEAD是对齐的，且到发版之前不会有新提交
+          git fetch origin dev
+          git checkout -B tauri origin/tauri
+          git merge --no-edit origin/dev
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/tauri)" ]; then
+            echo "ℹ️ tauri 分支无新增提交，跳过推送"
+          else
+            git push origin tauri
+          fi
+
+      - name: 🚀 创建 GitHub 发布
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.prepare-version.outputs.tag_name }}
+          name: ${{ needs.prepare-version.outputs.release_name }}
+          bodyFile: release_notes.md
+          # 幂等：同一版本重跑时更新已存在的 release，避免重复创建报错
+          allowUpdates: true
+          prerelease: ${{ needs.prepare-version.outputs.release_type != 'release' }}
+          draft: false
+          artifacts: |
+            artifacts/windows-artifacts/*.exe
+            artifacts/macos-x64-artifacts/*.dmg
+            artifacts/macos-arm64-artifacts/*.dmg
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ✅ 发布完成
+        run: |
+          RELEASE_LABEL="$RELEASE_LABEL"
+          RELEASE_VERSION="$VERSION"
+          echo "🎉 $RELEASE_LABEL v$RELEASE_VERSION 发布完成!"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/$TAG_NAME"
+          echo "🔗 发布页面: $RELEASE_URL"

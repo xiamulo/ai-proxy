@@ -1,0 +1,79 @@
+[project]
+name = "mtga-app"
+version = "0.1.0"
+description = "MTGA Tauri Python backend"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pytauri==0.8.*",
+    "pytauri-wheel==0.8.*",
+    "cryptography>=45.0.0",
+    "flask",
+    "requests",
+    "platformdirs>=4.3.0",
+    "PyYAML",
+    "xxhash>=3.5.0",
+    "litellm>=1.82.6,<2",
+]
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mtga_app*", "modules*"]
+exclude = ["build*", "target*", "pyembed*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+modules = ["resources/ca/**"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+    "ruff>=0.14.4",
+    "yamllint>=1.37.1",
+]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+extraPaths = ["."]
+exclude = [
+    ".uv_cache",
+    "**/node_modules",
+    "**/__pycache__",
+    # 👇 necessary, because when `tauri-cli bundles python,
+    # it will copy `pyembed` to the target directory (i.e., rust output dir).
+    "**/target",
+    # 👆
+    "**/dist",
+    "**/.venv",
+    "**/.*",
+    "**/build",
+    "**/mtga_app.egg-info",
+    "**/pyembed"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+# 开启常用规则集：E/F 是基础错误；I=imports；B=bugbear；UP=pyupgrade；SIM=简化；
+# PL= Pylint 规则子集（减少你对 Pylint 的依赖）
+[tool.ruff.lint]
+select  = ["E", "F", "I", "B", "UP", "SIM", "PL"]
+fixable = ["ALL"]  # 尽可能自动修复
+
+[tool.ruff.format]
+line-ending = "auto"

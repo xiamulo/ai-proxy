@@ -1,0 +1,705 @@
+name: 🚀 构建和发布版本(GUI)
+
+on:
+  push:
+    tags:
+      - "v1.*.*-*" # 预发布版标签格式：v1.2.0-beta.1, v1.2.0-rc.1
+      - "v1.*.*" # 正式版标签：v1.2.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 (例如: 1.2.0-beta.1)"
+        required: false
+        default: "1.2.0-beta.1"
+      release_type:
+        description: "发布类型"
+        required: true
+        default: "prerelease"
+        type: choice
+        options:
+          - prerelease
+          - release
+      start_commit:
+        description: >-
+          起始提交哈希（示例：
+          1234567890abcdef1234567890abcdef12345678）
+        required: false
+        default: ""
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  prepare-version:
+    name: 🧮 计算版本信息
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_type: ${{ steps.version.outputs.release_type }}
+      release_label: ${{ steps.version.outputs.release_label }}
+      release_name: ${{ steps.version.outputs.release_name }}
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: ⚙️ 获取版本信息
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.version }}" ]; then
+              VERSION="${{ github.event.inputs.version }}"
+            elif command -v python3 >/dev/null 2>&1; then
+              PY_VERSION_SCRIPT=$'import tomllib\n'\
+                $'from pathlib import Path\n\n'\
+                $'pyproject = Path("pyproject.toml")\n'\
+                $'data = tomllib.loads(pyproject.read_text(encoding="utf-8"))\n'\
+                $'version = data.get("project", {}).get("version")\n'\
+                $'if not version:\n'\
+                $'    raise SystemExit("Missing project.version")\n'\
+                $'print(version)'
+              VERSION=$(python3 -c "$PY_VERSION_SCRIPT")
+              echo "ℹ️ 未提供版本号，回退到 pyproject.toml 中的 $VERSION"
+            else
+              echo "❌ 无法解析 pyproject.toml，请在 workflow_dispatch 中提供版本号"
+              exit 1
+            fi
+            TAG_NAME="v$VERSION"
+            RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            if [[ "${TAG_NAME}" == *"-"* ]]; then
+              RELEASE_TYPE="prerelease"
+            else
+              RELEASE_TYPE="release"
+            fi
+          fi
+
+          if [ "$RELEASE_TYPE" = "release" ]; then
+            RELEASE_LABEL="正式发布版"
+          else
+            RELEASE_LABEL="预发布版"
+          fi
+          RELEASE_NAME="v${VERSION}"
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "release_label=$RELEASE_LABEL" >> $GITHUB_OUTPUT
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+
+  build-macos:
+    name: 🍎 构建 macOS
+    needs: prepare-version
+    runs-on: macos-latest
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.uv_cache
+    strategy:
+      matrix:
+        arch:
+          # - x64
+          - arm64
+        include:
+          # - arch: x64
+          #   runner_arch: x86_64
+          #   nuitka_arch: x86_64
+          - arch: arm64
+            runner_arch: arm64
+            nuitka_arch: arm64
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🔍 调试 uv.lock
+        run: |
+          pwd
+          ls -l uv.lock || echo "uv.lock 不存在"
+          head -5 uv.lock || true
+
+      - name: 🧮 计算 uv.lock 哈希
+        id: uv-lock-hash
+        run: |
+          if [ -f uv.lock ]; then
+            echo "hash=$(shasum -a 256 uv.lock | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "hash=missing" >> "$GITHUB_OUTPUT"
+            echo "⚠️ uv.lock 不存在，缓存 key 使用 missing"
+          fi
+
+      - name: 💾 缓存 uv 依赖
+        uses: actions/cache@v5
+        with:
+          path: |
+            .venv
+            .uv_cache
+            ~/.local/bin/uv
+            ~/.local/bin/uvx
+          key: ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-${{ matrix.arch }}-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-${{ matrix.arch }}-
+
+      - name: 📦 安装 uv
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          # 安装脚本内部会从 GitHub 下载 release 资源，网络抖动时可能打印 curl 错误但最终退出 0，
+          # 因此这里以 "uv 是否可用" 作为成功判定并重试，避免后续出现 uv: command not found。
+          for i in 1 2 3; do
+            if command -v uv >/dev/null 2>&1; then
+              break
+            fi
+            echo "🔁 尝试安装 uv（第 $i 次）..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh || true
+            sleep $((i * 5))
+          done
+
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "❌ uv 安装失败（多次重试后仍不可用）"
+            exit 1
+          fi
+
+          uv --version
+
+      - name: 🔧 安装依赖
+        run: |
+          uv sync --group mac-build
+
+      - name: 💾 缓存 Nuitka 工具
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.local/share/Nuitka
+            ~/.cache/nuitka
+          key: ${{ runner.os }}-nuitka-${{ matrix.arch }}-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-${{ matrix.arch }}-
+      - name: 🛠️ 安装 Xcode Command Line Tools
+        run: |
+          sudo xcode-select --install || true
+          # 等待安装完成或跳过如果已安装
+          while ! xcode-select -p &>/dev/null; do
+            echo "等待 Xcode Command Line Tools 安装..."
+            sleep 10
+          done
+
+      - name: 🧭 设置版本环境变量
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "MTGA_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "APP_NAME=mtga_gui" >> $GITHUB_ENV
+          echo "DMG_NAME=MTGA_GUI-v${VERSION}-${{ matrix.arch }}" >> $GITHUB_ENV
+
+      - name: 🔨 构建 macOS 应用包
+        run: |
+          # 修改构建脚本中的版本号
+          sed -i.bak \
+            "s/VERSION=\".*\"/VERSION=\"${VERSION}\"/g" \
+            build_mac_app.sh
+
+          # 根据架构设置输出文件名，替换 $(uname -m) 为具体架构
+          sed -i.bak "s/\$(uname -m)/${{ matrix.arch }}/g" build_mac_app.sh
+
+          # 显示修改后的构建脚本相关行，用于调试
+          echo "🔍 检查修改后的构建脚本:"
+          echo "VERSION 行:"
+          grep "VERSION=" build_mac_app.sh | head -1
+          echo "output-filename 行:"
+          grep "output-filename" build_mac_app.sh
+
+          # 执行构建
+          chmod +x build_mac_app.sh
+          ./build_mac_app.sh
+
+          # Nuitka 在 macOS 应用包模式下忽略 --output-filename，总是使用源文件名
+          # 需要手动重命名到期望的文件名
+          # if [ -d "dist-onefile/mtga_gui.app" ]; then
+          #   EXPECTED_NAME="${APP_NAME}.app"
+          #   echo "🔄 重命名应用包: mtga_gui.app → $EXPECTED_NAME"
+          #   mv "dist-onefile/mtga_gui.app" "dist-onefile/$EXPECTED_NAME"
+          #   echo "✅ 重命名完成"
+          # fi
+
+      - name: 📱 验证应用包
+        run: |
+          echo "🔍 检查 dist-onefile 目录内容:"
+          ls -la dist-onefile/ || echo "❌ dist-onefile 目录不存在"
+
+          # 查找实际生成的 .app 文件
+          APP_FILES=(dist-onefile/*.app)
+          if [ ! -e "${APP_FILES[0]}" ]; then
+            echo "❌ 没有找到 .app 文件"
+            echo "📁 当前目录结构:"
+            find dist-onefile/ -type f -name "*.app" 2>/dev/null || echo "没有找到任何 .app 文件"
+            exit 1
+          fi
+
+          # 使用找到的第一个 .app 文件
+          ACTUAL_APP_PATH="${APP_FILES[0]}"
+          echo "✅ 应用包构建成功: $ACTUAL_APP_PATH"
+          echo "📊 应用包大小: $(du -sh "$ACTUAL_APP_PATH" | cut -f1)"
+          echo "📁 应用包结构:"
+          find "$ACTUAL_APP_PATH" -maxdepth 2 -type d | head -10
+
+          # 检查期望的文件名是否匹配
+          EXPECTED_PATH="dist-onefile/${APP_NAME}.app"
+          if [ "$ACTUAL_APP_PATH" != "$EXPECTED_PATH" ]; then
+            echo "⚠️ 警告: 实际文件名与期望不符"
+            echo "期望: $EXPECTED_PATH"
+            echo "实际: $ACTUAL_APP_PATH"
+          fi
+
+      - name: 🎁 创建 DMG 安装包
+        run: |
+          # 确保 DMG 配置文件存在
+          if [ ! -f "mac/dmg_settings.py" ]; then
+            echo "❌ DMG 配置文件不存在: mac/dmg_settings.py"
+            exit 1
+          fi
+
+          # 查找实际的 .app 文件
+          APP_FILES=(dist-onefile/*.app)
+          if [ ! -e "${APP_FILES[0]}" ]; then
+            echo "❌ 没有找到 .app 文件用于创建 DMG"
+            exit 1
+          fi
+
+          ACTUAL_APP_PATH="${APP_FILES[0]}"
+
+          DMG_PATH="dist-onefile/${DMG_NAME}.dmg"
+
+          echo "📦 使用应用包: $ACTUAL_APP_PATH"
+          echo "📦 DMG 文件名: ${DMG_NAME}.dmg"
+
+          # 设置环境变量供DMG配置文件使用，包含完整路径
+          export MTGA_APP_NAME="$ACTUAL_APP_PATH"
+          echo "🔧 设置 DMG 应用路径: $MTGA_APP_NAME"
+
+          # 创建 DMG
+          uv run dmgbuild \
+            -s mac/dmg_settings.py \
+            "MTGA GUI v${VERSION} Installer" \
+            "$DMG_PATH"
+
+          echo "✅ DMG 创建成功"
+          DMG_SIZE=$(du -sh "$DMG_PATH" | cut -f1)
+          echo "📊 DMG 大小: $DMG_SIZE"
+
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.arch }}-artifacts
+          path: |
+            dist-onefile/*.app
+            dist-onefile/*.dmg
+          retention-days: 7
+
+  # Windows 构建任务（预留框架）
+  build-windows:
+    name: 🪟 构建 Windows
+    needs: prepare-version
+    runs-on: windows-latest
+    env:
+      UV_CACHE_DIR: "${{ github.workspace }}\\.uv_cache"
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+
+      - name: 🐍 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🔍 调试 uv.lock
+        run: |
+          Get-Location
+          if (Test-Path uv.lock) {
+            Get-Item uv.lock | Format-List FullName,Length
+            Get-Content uv.lock -TotalCount 5
+          } else {
+            Write-Host "uv.lock 不存在"
+          }
+
+      - name: 🧮 计算 uv.lock 哈希
+        id: uv-lock-hash
+        run: |
+          if (Test-Path uv.lock) {
+            $hash = (Get-FileHash uv.lock -Algorithm SHA256).Hash
+          } else {
+            $hash = "missing"
+            Write-Host "⚠️ uv.lock 不存在，缓存 key 使用 missing"
+          }
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 💾 缓存 uv 依赖
+        uses: actions/cache@v5
+        with:
+          path: |
+            .venv
+            .uv_cache
+            ${{ env.USERPROFILE }}\.local\bin\uv.exe
+            ${{ env.USERPROFILE }}\.local\bin\uvx.exe
+          key: ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-win-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-py-${{ steps.setup-python.outputs.python-version }}-uv-win-
+
+      - name: 📦 安装 uv
+        run: |
+          $ErrorActionPreference = "Stop"
+          $uvBinDir = Join-Path $env:USERPROFILE ".local\\bin"
+          $env:PATH = "$uvBinDir;$env:PATH"
+          $uvBinDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          for ($i = 1; $i -le 3; $i++) {
+            if (Get-Command uv -ErrorAction SilentlyContinue) {
+              break
+            }
+            Write-Host "🔁 尝试安装 uv（第 $i 次）..."
+            try {
+              Invoke-WebRequest -Uri "https://astral.sh/uv/install.ps1" -OutFile "install.ps1"
+              ./install.ps1
+            } catch {
+              Write-Host "⚠️ uv 安装脚本执行失败: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (5 * $i)
+          }
+
+          if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+            throw "uv 安装失败（多次重试后仍不可用）"
+          }
+
+          uv --version
+
+      - name: 🔧 安装依赖
+        run: |
+          uv sync --group win-build
+
+      - name: 💾 缓存 Nuitka 工具
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ env.USERPROFILE }}\AppData\Local\Nuitka
+          key: ${{ runner.os }}-nuitka-win-${{ steps.uv-lock-hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-win-
+
+      - name: 🔍 检查 Visual Studio
+        run: |
+          $vcBuildDir = $null
+          $vswhereBase = ${env:ProgramFiles(x86)}
+          $vsInstallerPath = "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vswherePath = Join-Path $vswhereBase $vsInstallerPath
+          if (Test-Path $vswherePath) {
+            try {
+              $vswhereArgs = @(
+                '-latest'
+                '-products'
+                '*'
+                '-requires'
+                'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+                '-property'
+                'installationPath'
+              )
+              $installationPath = & $vswherePath @vswhereArgs
+              if ($installationPath) {
+                $candidate = Join-Path $installationPath "VC\Auxiliary\Build"
+                if (Test-Path $candidate) {
+                  $vcBuildDir = $candidate
+                }
+              }
+            } catch {
+              Write-Host "⚠️ vswhere 检测失败: $_"
+            }
+          }
+
+          if (-not $vcBuildDir) {
+            $fallbackPaths = @(
+              "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build",
+              "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build",
+              "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build",
+              "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build"
+            )
+
+            foreach ($path in $fallbackPaths) {
+              if (Test-Path $path) {
+                $vcBuildDir = $path
+                break
+              }
+            }
+          }
+
+          if ($vcBuildDir) {
+            Write-Host "✅ 找到可用的 MSVC 环境: $vcBuildDir"
+            "VC_BUILD_DIR=$vcBuildDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "❌ 未找到任何已安装的 Visual Studio MSVC 环境，后续构建可能失败"
+          }
+
+      - name: 🧭 设置版本环境变量
+        run: |
+          $version = "${{ needs.prepare-version.outputs.version }}"
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MTGA_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $exeName = "MTGA_GUI-v$version-x64.exe"
+          "EXE_NAME=$exeName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 🔨 构建 Windows 单文件版本
+        run: |
+          # 修改构建脚本中的版本号
+          $content = Get-Content "build_onefile.bat"
+          $pattern = 'set "VERSION=.*"'
+          $newVersionLine = "set `"VERSION=$env:VERSION`""
+          $content = $content -replace $pattern, $newVersionLine
+          $content | Set-Content "build_onefile.bat"
+
+          # 显示修改后的版本号
+          Write-Host "🔍 检查修改后的构建脚本:"
+          Select-String -Path "build_onefile.bat" -Pattern "VERSION=" | Select-Object -First 1
+
+          # 执行构建
+          try {
+            if ($env:VC_BUILD_DIR) {
+              Write-Host "ℹ️ 传递检测到的 MSVC 目录: $env:VC_BUILD_DIR"
+              & .\build_onefile.bat "$env:VC_BUILD_DIR"
+            } else {
+              & .\build_onefile.bat
+            }
+            Write-Host "✅ 构建脚本执行完成"
+          } catch {
+            Write-Host "❌ 构建失败: $_"
+            exit 1
+          }
+
+      - name: 📱 验证可执行文件
+        run: |
+          $expectedName = "$env:EXE_NAME"
+          $expectedPath = Join-Path "dist-onefile" $expectedName
+
+          if (-not (Test-Path "dist-onefile")) {
+            Write-Host "❌ dist-onefile 目录不存在，无法找到构建产物"
+            exit 1
+          }
+
+          if (-not (Test-Path $expectedPath)) {
+            $latestExe = Get-ChildItem -Path "dist-onefile" -Filter *.exe -File `
+              -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+            if ($latestExe) {
+              Write-Host "⚠️ 发现未命名为期望格式的可执行文件: $($latestExe.Name)"
+              Rename-Item -Path $latestExe.FullName -NewName $expectedName -Force
+            }
+          }
+
+          if (Test-Path $expectedPath) {
+            $size = (Get-Item $expectedPath).Length / 1MB
+            Write-Host "✅ Windows 可执行文件构建成功: $expectedPath"
+            Write-Host "📊 文件大小: $([math]::Round($size, 2)) MB"
+
+            $fileInfo = Get-Item $expectedPath
+            Write-Host "📋 文件信息:"
+            Write-Host "  - 创建时间: $($fileInfo.CreationTime)"
+            Write-Host "  - 修改时间: $($fileInfo.LastWriteTime)"
+            Write-Host "  - 文件属性: $($fileInfo.Attributes)"
+            $envLine = "WINDOWS_EXE_PATH=$expectedPath"
+            $envLine | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "❌ 未找到预期的可执行文件: $expectedPath"
+            Write-Host "📁 dist-onefile 目录内容:"
+            Get-ChildItem -Path "dist-onefile" -Recurse | ForEach-Object {
+              if ($_.PSIsContainer) {
+                Write-Host "  [目录] $($_.FullName)"
+              } else {
+                Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1MB, 2)) MB)"
+              }
+            }
+            exit 1
+          }
+
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-artifacts
+          path: |
+            dist-onefile/*.exe
+          retention-days: 7
+
+  create-release:
+    name: 🚀 创建 GitHub 发布
+    needs: [prepare-version, build-windows, build-macos]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 📥 下载所有构建产物
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: 📋 列出构建产物
+        run: |
+          echo "🗂️ 构建产物列表:"
+          find artifacts -type f \( -name "*.app" -o -name "*.dmg" -o -name "*.exe" \) | sort
+
+      - name: 🧭 设置发布环境变量
+        run: |
+          echo "VERSION=${{ needs.prepare-version.outputs.version }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.prepare-version.outputs.tag_name }}" >> $GITHUB_ENV
+          echo "RELEASE_TYPE=${{ needs.prepare-version.outputs.release_type }}" >> $GITHUB_ENV
+          echo "RELEASE_LABEL=${{ needs.prepare-version.outputs.release_label }}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${{ needs.prepare-version.outputs.release_name }}" >> $GITHUB_ENV
+
+      - name: 🏷️ 创建或更新标签
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          LABEL="$RELEASE_LABEL"
+          if [ "$LABEL" = "预发布版" ]; then
+            EMOJI="🚀"
+          else
+            EMOJI="🎉"
+          fi
+
+          # 删除已存在的标签（如果有）
+          git tag -d "$TAG_NAME" || true
+          git push origin :refs/tags/"$TAG_NAME" || true
+
+          # 创建新标签
+          git tag -a "$TAG_NAME" \
+            -m "$EMOJI $LABEL $VERSION"
+          git push origin "$TAG_NAME"
+
+      - name: 📝 生成发布说明
+        id: release_notes
+        run: |
+          TAG_NAME="$TAG_NAME"
+          START_COMMIT_INPUT="${{ github.event.inputs.start_commit || '' }}"
+          TARGET_COMMIT="${{ github.sha }}"
+          START_COMMIT_SOURCE="user-input"
+
+          FEAT_TEMP=$(mktemp)
+          FIX_TEMP=$(mktemp)
+          trap 'rm -f "$FEAT_TEMP" "$FIX_TEMP"' EXIT
+
+          append_release_entry() {
+            local subject="$1"
+            local hash="$2"
+            if [ -z "$subject" ]; then
+              return
+            fi
+            if echo "$subject" | grep -Eq '^feat\b'; then
+              echo "- $subject ($hash)" >> "$FEAT_TEMP"
+            elif echo "$subject" | grep -Eq '^fix\b'; then
+              echo "- $subject ($hash)" >> "$FIX_TEMP"
+            fi
+          }
+
+          if [ -z "$START_COMMIT_INPUT" ]; then
+            START_COMMIT_SOURCE="previous-tag"
+            TAG_PATTERN='v*'
+            PREV_TAG=$(git tag -l "$TAG_PATTERN" --sort=-version:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -Fvx "$TAG_NAME" | head -n 1)
+            if [ -z "$PREV_TAG" ]; then
+              echo "❌ 未找到上一正式版标签可用作起始提交"
+              exit 1
+            fi
+            START_COMMIT_INPUT=$(git rev-parse "$PREV_TAG^{commit}")
+            echo "ℹ️ 未提供起始提交，使用上一正式版标签 $PREV_TAG ($START_COMMIT_INPUT)"
+          else
+            echo "ℹ️ 使用传入的起始提交：$START_COMMIT_INPUT"
+          fi
+          if ! git cat-file -e "$START_COMMIT_INPUT^{commit}" 2>/dev/null; then
+            echo "❌ 无法在仓库中找到起始提交：$START_COMMIT_INPUT"
+            exit 1
+          fi
+
+          START_COMMIT=$(git rev-parse "$START_COMMIT_INPUT")
+
+          if ! git merge-base --is-ancestor "$START_COMMIT" "$TARGET_COMMIT"; then
+            echo "❌ 起始提交不在当前构建提交的历史中：$START_COMMIT_INPUT"
+            exit 1
+          fi
+
+          START_SUBJECT=$(git show -s --format='%s' "$START_COMMIT")
+          append_release_entry "$START_SUBJECT" "$START_COMMIT"
+          echo "ℹ️ 发布说明范围: $START_COMMIT..$TARGET_COMMIT (起始来源: $START_COMMIT_SOURCE)"
+
+          git log --format='%H%x09%s' --reverse "$START_COMMIT..$TARGET_COMMIT" |
+            while IFS=$'\t' read -r HASH SUBJECT; do
+            append_release_entry "$SUBJECT" "$HASH"
+          done
+
+          {
+            echo "## :sparkles: 新功能"
+            if [ -s "$FEAT_TEMP" ]; then
+              cat "$FEAT_TEMP"
+            else
+              echo "- 暂无新功能"
+            fi
+            echo
+            echo "## :bug: 修复"
+            if [ -s "$FIX_TEMP" ]; then
+              cat "$FIX_TEMP"
+            else
+              echo "- 暂无修复"
+            fi
+          } > release_notes.md
+
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: 🚀 创建 GitHub 发布
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.prepare-version.outputs.tag_name }}
+          name: ${{ needs.prepare-version.outputs.release_name }}
+          body: ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+          prerelease: ${{ needs.prepare-version.outputs.release_type != 'release' }}
+          draft: false
+          artifacts: |
+            artifacts/windows-artifacts/*.exe
+            artifacts/macos-arm64-artifacts/*.dmg
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ✅ 发布完成
+        run: |
+          RELEASE_LABEL="$RELEASE_LABEL"
+          RELEASE_VERSION="$VERSION"
+          echo "🎉 $RELEASE_LABEL v$RELEASE_VERSION 发布完成!"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/$TAG_NAME"
+          echo "🔗 发布页面: $RELEASE_URL"

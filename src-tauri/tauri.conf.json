@@ -1,0 +1,65 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "ai-proxy",
+  "version": "2.6.0",
+  "identifier": "com.aiproxy.tauri",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm generate",
+    "removeUnusedCommands": true
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "AI Proxy",
+        "width": 1200,
+        "height": 800,
+        "visible": false,
+        "backgroundColor": "#0f172a",
+        "resizable": true,
+        "fullscreen": false
+      },
+      {
+        "label": "splash",
+        "title": "AI Proxy",
+        "width": 1200,
+        "height": 800,
+        "url": "splashscreen.html",
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#0f172a"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "dmg"],
+    "resources": {
+      "pyembed/python": "./"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      },
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": true,
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  }
+}

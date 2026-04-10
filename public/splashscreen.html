@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MTGA</title>
+    <style>
+      :root {
+        --initial-bg: #f7f8fb;
+        --initial-text: #0f172a;
+        --initial-spinner-track: #e5e7eb;
+        --initial-spinner-top: #f0bb32;
+        --initial-gradient: linear-gradient(135deg, #fffbeb 0%, #fff9e6 45%, #fff2e0 100%);
+        color-scheme: light;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --initial-bg: #0f172a;
+          --initial-text: #f1f5f9;
+          --initial-spinner-track: #1e293b;
+          --initial-spinner-top: #fbbf24;
+          --initial-gradient: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+          color-scheme: dark;
+        }
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        background-color: var(--initial-bg);
+      }
+
+      body {
+        background-image: var(--initial-gradient);
+        color: var(--initial-text);
+        font-family:
+          "Inter",
+          "Segoe UI",
+          system-ui,
+          -apple-system,
+          sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+      }
+
+      #initial-loading-overlay {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        /* 移除 fadeIn 动画以避免启动白屏感 */
+      }
+
+      .initial-spinner {
+        width: 48px;
+        height: 48px;
+        border: 3.5px solid var(--initial-spinner-track);
+        border-top: 3.5px solid var(--initial-spinner-top);
+        border-radius: 50%;
+        animation: initial-spin 0.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        box-shadow: 0 4px 12px rgba(240, 187, 50, 0.1);
+      }
+
+      .initial-loading-text {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--initial-text);
+        opacity: 0.6;
+        margin-top: 24px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      @keyframes initial-spin {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="initial-loading-overlay">
+      <div class="initial-spinner" aria-label="Loading"></div>
+      <div class="initial-loading-text">Loading MTGA...</div>
+    </div>
+    <script>
+      (function () {
+        var emitted = false;
+        var retries = 0;
+
+        function emitReady(source) {
+          if (emitted) return;
+          var tauri = window.__TAURI__;
+          var eventApi = tauri && tauri.event;
+          if (!eventApi || typeof eventApi.emit !== "function") {
+            retries += 1;
+            if (retries <= 5) {
+              setTimeout(function () {
+                emitReady(source + "_retry");
+              }, 50);
+            }
+            return;
+          }
+          emitted = true;
+          try {
+            eventApi.emit("mtga:overlay-ready", {
+              source: source,
+              ts_ms: Date.now(),
+            });
+          } catch (error) {
+            // ignore
+          }
+        }
+
+        function checkVisible(label) {
+          var overlay = document.getElementById("initial-loading-overlay");
+          if (!overlay) return;
+          var rect = overlay.getBoundingClientRect();
+          var style = getComputedStyle(overlay);
+          var visible =
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.opacity !== "0";
+          if (visible) {
+            emitReady(label);
+          }
+        }
+
+        requestAnimationFrame(function () {
+          checkVisible("splash_raf");
+        });
+        setTimeout(function () {
+          checkVisible("splash_t0");
+        }, 0);
+        setTimeout(function () {
+          checkVisible("splash_t50");
+        }, 50);
+      })();
+    </script>
+  </body>
+</html>

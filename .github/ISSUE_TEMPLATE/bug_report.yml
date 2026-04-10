@@ -1,0 +1,56 @@
+name: 🐞 Bug Report（通用）
+description: 不属于下面分类的异常/崩溃/功能异常
+title: "[BUG] 简要标题"
+labels: [bug]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 操作系统
+      options: [Windows 10/11, macOS Apple Silicon, macOS Intel, Linux]
+    validations:
+      required: true
+  - type: textarea
+    id: sysinfo
+    attributes:
+      label: 系统与内核信息（务必粘贴命令输出）
+      description: |
+        - macOS / Linux：请粘贴 `uname -mprs` 的完整输出
+        - Windows（PowerShell）：请粘贴以下命令的完整输出：
+          `Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture`
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: 版本信息
+      placeholder: MTGA GUI vX.Y.Z / Trae vA.B.C
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      placeholder: 简要说明问题与影响
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: 1) … 2) … 3) …
+    validations:
+      required: true
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: 预期 vs 实际
+      placeholder: 预期：…；实际：…
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志/截图（可附代码块）
+      render: shell

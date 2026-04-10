@@ -1,0 +1,40 @@
+name: ✨ 功能需求（Feature Request）
+description: 提出一个清晰、可讨论、可拆分的功能建议
+title: "[Feat] 简要标题"
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 背景/痛点
+      description: 这个需求解决什么问题？目前的工作流在哪卡住？
+      placeholder: 当我…时，需要…
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你的设想
+      description: 粗粒度描述功能形态（UI、配置、API 等）
+      placeholder: 例如：在设置页新增…；新增 CLI 选项…
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已尝试的替代方案
+      placeholder: 我尝试过…但…
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 影响范围（可多选）
+      options:
+        - label: GUI
+        - label: 脚本/命令行
+        - label: Trae 侧行为
+        - label: 文档/示例/FAQ
+  - type: input
+    id: metrics
+    attributes:
+      label: 成功标准（可选）
+      placeholder: 例如“减少 XX 步骤/配置”“支持 YY 平台”

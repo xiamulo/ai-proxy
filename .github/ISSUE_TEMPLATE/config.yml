@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 快速开始（Windows/macOS）
+    url: https://github.com/BiFangKNT/mtga#%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B
+    about: 新手请先按此文档完成安装与一键启动
+  - name: 🛠️ Trae 连接/创建模型失败排查
+    url: https://github.com/BiFangKNT/mtga#trae-%E7%AB%AF%E6%8F%90%E7%A4%BA-%E6%B7%BB%E5%8A%A0%E6%A8%A1%E5%9E%8B%E5%A4%B1%E8%B4%A5-%E7%9A%84%E6%8E%92%E6%9F%A5%E6%96%B9%E6%A1%88
+    about: 先自查 hosts/证书/443 端口等常见原因
+  - name: 🍎 macOS “包已损坏/无法打开”解决方案
+    url: https://github.com/BiFangKNT/mtga?tab=readme-ov-file#macos-%E8%A7%A3%E5%86%B3-%E5%8C%85%E5%B7%B2%E6%8D%9F%E5%9D%8F-%E9%97%AE%E9%A2%98
+    about: macOS 被阻止打开时的处理步骤（可以图形化的形式解决）
+  - name: 🧾 Releases 下载页
+    url: https://github.com/BiFangKNT/mtga/releases
+    about: 建议优先使用最新版本
