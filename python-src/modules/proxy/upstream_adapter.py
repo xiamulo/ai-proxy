@@ -116,6 +116,24 @@ def _build_prompt_cache_key(bucket_id: str) -> str:
     return bucket_id.strip().lower()
 
 
+def _is_litellm_known_model(model_id: str) -> bool:
+    """Check if litellm can resolve this model name without an explicit provider prefix."""
+    try:
+        litellm.get_llm_provider(model_id)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ensure_openai_prefix(model_id: str) -> str:
+    """Auto-add ``openai/`` prefix for models that litellm cannot resolve on its own."""
+    if "/" in model_id:
+        return model_id
+    if _is_litellm_known_model(model_id):
+        return model_id
+    return f"openai/{model_id}"
+
+
 def build_upstream_route(
     proxy_config: ProxyConfig,
     *,
@@ -132,11 +150,10 @@ def build_upstream_route(
         provider=effective_provider,
     )
     base_url = proxy_config.target_api_base_url.rstrip("/") + middle_route
-    if effective_provider in (
-        OPENAI_RESPONSE_PROVIDER,
-        OPENAI_CHAT_COMPLETION_PROVIDER,
-    ):
+    if effective_provider == OPENAI_RESPONSE_PROVIDER:
         litellm_model = proxy_config.target_model_id
+    elif effective_provider == OPENAI_CHAT_COMPLETION_PROVIDER:
+        litellm_model = _ensure_openai_prefix(proxy_config.target_model_id)
     else:
         litellm_model = f"{effective_provider}/{proxy_config.target_model_id}"
     litellm_base_url = _build_litellm_base_url(

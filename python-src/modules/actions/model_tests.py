@@ -104,6 +104,7 @@ def _consume_stream_response(
 ) -> tuple[str, int | str]:
     """消费流式响应，返回 (拼接内容, total_tokens)。"""
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     total_tokens: int | str = "未知"
     for chunk in response_payload:
         chunk_dict = _coerce_payload_dict(chunk)
@@ -120,12 +121,16 @@ def _consume_stream_response(
                     c = delta.get("content")
                     if isinstance(c, str):
                         content_parts.append(c)
+                    rc = delta.get("reasoning_content")
+                    if isinstance(rc, str):
+                        reasoning_parts.append(rc)
         usage_obj = _coerce_object_dict(chunk_dict.get("usage"))
         if usage_obj is not None:
             tok = usage_obj.get("total_tokens")
             if isinstance(tok, (int, str)):
                 total_tokens = tok
-    return "".join(content_parts), total_tokens
+    combined = "".join(content_parts) or "".join(reasoning_parts)
+    return combined, total_tokens
 
 
 def _build_model_discovery_strategies(
