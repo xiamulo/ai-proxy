@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v2.7.0 - 2026-04-10
+
+### :sparkles: 新功能
+
+- v2.7.0 - fix litellm openai prefix auto-detect, reasoning_content support, remove update checker ([4e8039f](https://github.com/xiamulo/ai-proxy/commit/4e8039f98bc17ae75f2b87be69637971a384341c))
+
 ## v2.4.0 - 2026-04-03
 
 ### :sparkles: 新功能
