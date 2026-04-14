@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import os
 import ssl
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 import litellm
@@ -31,6 +34,8 @@ CHAT_COMPLETIONS_REQUEST_API: RequestApi = "chat_completions"
 RESPONSES_REQUEST_API: RequestApi = "responses"
 LITELLM_CONNECT_RETRY_COUNT = 2
 UPSTREAM_PARAM_SELF_HEAL_MAX_ATTEMPTS = 3
+WEBSOCKET_SESSION_IDLE_TIMEOUT_SECONDS = 15 * 60
+WEBSOCKET_SESSION_MAX_COUNT = 64
 OPENAI_CHAT_COMPLETION_STANDARD_PARAMS: frozenset[str] = frozenset(
     {
         "model",
@@ -111,6 +116,35 @@ class ResponsesWebSocketFunctionCallState:
     call_id: str
     name: str
     arguments_streamed: bool = False
+
+
+@dataclass
+class ResponsesWebSocketSessionState:
+    session_id: str
+    explicit_session_key: bool
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    client: OpenAI | None = None
+    connection_context: Any = None
+    connection: Any = None
+    connection_started_at: float = 0.0
+    last_used_at: float = 0.0
+    last_response_id: str | None = None
+    conversation_messages: list[dict[str, Any]] = field(
+        default_factory=lambda: cast(list[dict[str, Any]], [])
+    )
+
+
+class ResponsesWebSocketSessionError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
 
 
 def _build_litellm_base_url(
@@ -213,6 +247,8 @@ class LiteLLMUpstreamAdapter:
         self._disable_ssl_strict_mode = disable_ssl_strict_mode
         self._log = log_func
         self._param_self_heal = UpstreamParamSelfHealController()
+        self._websocket_sessions: dict[str, ResponsesWebSocketSessionState] = {}
+        self._websocket_sessions_lock = threading.RLock()
 
     def build_route(
         self,
@@ -462,6 +498,228 @@ class LiteLLMUpstreamAdapter:
     @staticmethod
     def _new_legacy_function_call_id(index: int) -> str:
         return f"call_legacy_{index}"
+
+    @staticmethod
+    def _new_websocket_session_id() -> str:
+        return f"ws_{os.urandom(6).hex()}"
+
+    @staticmethod
+    def _clone_message_list(messages: list[Any]) -> list[dict[str, Any]]:
+        cloned = copy.deepcopy(messages)
+        return [cast(dict[str, Any], item) for item in cloned if isinstance(item, dict)]
+
+    @staticmethod
+    def _messages_extend_prefix(
+        previous_messages: list[dict[str, Any]],
+        current_messages: list[dict[str, Any]],
+    ) -> bool:
+        previous_count = len(previous_messages)
+        if previous_count == 0 or len(current_messages) <= previous_count:
+            return False
+        return current_messages[:previous_count] == previous_messages
+
+    @staticmethod
+    def _extract_websocket_session_key(request_data: dict[str, Any]) -> tuple[str | None, bool]:
+        metadata_obj = request_data.get("metadata")
+        if isinstance(metadata_obj, dict):
+            metadata = cast(dict[str, Any], metadata_obj)
+            for key in (
+                "mtga_ws_session_id",
+                "mtga_session_id",
+                "session_id",
+                "conversation_id",
+                "chat_id",
+                "thread_id",
+            ):
+                value_obj = metadata.get(key)
+                if isinstance(value_obj, str) and value_obj.strip():
+                    return value_obj.strip(), True
+        return None, False
+
+    def _collect_stale_websocket_sessions_locked(
+        self, *, now: float
+    ) -> list[ResponsesWebSocketSessionState]:
+        stale_keys: list[str] = []
+        for key, session in self._websocket_sessions.items():
+            last_used_at = session.last_used_at or session.connection_started_at
+            if last_used_at <= 0:
+                stale_keys.append(key)
+                continue
+            if now - last_used_at >= WEBSOCKET_SESSION_IDLE_TIMEOUT_SECONDS:
+                stale_keys.append(key)
+        stale_sessions: list[ResponsesWebSocketSessionState] = []
+        for key in stale_keys:
+            session = self._websocket_sessions.pop(key, None)
+            if session is not None:
+                stale_sessions.append(session)
+        return stale_sessions
+
+    def _prune_websocket_sessions(self) -> None:
+        now = time.time()
+        with self._websocket_sessions_lock:
+            stale_sessions = self._collect_stale_websocket_sessions_locked(now=now)
+        for session in stale_sessions:
+            with session.lock:
+                self._close_websocket_session(session)
+                self._reset_websocket_session_chain(session)
+
+    def _enforce_websocket_session_capacity(self) -> None:
+        sessions_to_close: list[ResponsesWebSocketSessionState] = []
+        with self._websocket_sessions_lock:
+            overflow = len(self._websocket_sessions) - WEBSOCKET_SESSION_MAX_COUNT
+            if overflow <= 0:
+                return
+            sorted_sessions = sorted(
+                self._websocket_sessions.values(),
+                key=lambda session: session.last_used_at or session.connection_started_at,
+            )
+            for session in sorted_sessions[:overflow]:
+                removed = self._websocket_sessions.pop(session.session_id, None)
+                if removed is not None:
+                    sessions_to_close.append(removed)
+        for session in sessions_to_close:
+            with session.lock:
+                self._close_websocket_session(session)
+                self._reset_websocket_session_chain(session)
+
+    def _close_websocket_session(self, session: ResponsesWebSocketSessionState) -> None:
+        connection_context = session.connection_context
+        session.connection = None
+        session.connection_context = None
+        session.client = None
+        session.connection_started_at = 0.0
+        if connection_context is not None:
+            with contextlib.suppress(Exception):
+                connection_context.__exit__(None, None, None)
+
+    def _reset_websocket_session_chain(self, session: ResponsesWebSocketSessionState) -> None:
+        session.last_response_id = None
+        session.conversation_messages = []
+
+    def _open_websocket_session_connection(
+        self,
+        *,
+        session: ResponsesWebSocketSessionState,
+        route: UpstreamRoute,
+        reconnect_reason: str | None = None,
+    ) -> None:
+        if reconnect_reason:
+            self._log(
+                "OpenAI Responses WebSocket 会话重连: "
+                f"session={session.session_id} reason={reconnect_reason}"
+            )
+        self._close_websocket_session(session)
+        client = OpenAI(api_key=route.api_key, base_url=route.base_url)
+        connection_context = client.responses.connect()
+        connection = connection_context.__enter__()
+        now = time.time()
+        session.client = client
+        session.connection_context = connection_context
+        session.connection = connection
+        session.connection_started_at = now
+        session.last_used_at = now
+
+    def _ensure_websocket_session_connection(
+        self,
+        *,
+        session: ResponsesWebSocketSessionState,
+        route: UpstreamRoute,
+    ) -> None:
+        connection_age = time.time() - session.connection_started_at
+        if session.connection is not None and connection_age < 55 * 60:
+            session.last_used_at = time.time()
+            return
+        reconnect_reason = (
+            "connection_limit_guard"
+            if session.connection is not None
+            else "initial_connect"
+        )
+        self._open_websocket_session_connection(
+            session=session,
+            route=route,
+            reconnect_reason=reconnect_reason,
+        )
+
+    def _find_matching_websocket_session(
+        self,
+        *,
+        current_messages: list[dict[str, Any]],
+    ) -> ResponsesWebSocketSessionState | None:
+        best_session: ResponsesWebSocketSessionState | None = None
+        best_prefix_len = -1
+        best_match_count = 0
+        for session in self._websocket_sessions.values():
+            if session.explicit_session_key or not session.conversation_messages:
+                continue
+            if not self._messages_extend_prefix(session.conversation_messages, current_messages):
+                continue
+            prefix_len = len(session.conversation_messages)
+            if prefix_len > best_prefix_len:
+                best_session = session
+                best_prefix_len = prefix_len
+                best_match_count = 1
+                continue
+            if prefix_len == best_prefix_len:
+                best_match_count += 1
+        if best_match_count == 1:
+            return best_session
+        return None
+
+    def _get_or_create_websocket_session(
+        self,
+        *,
+        request_data: dict[str, Any],
+        current_messages: list[dict[str, Any]],
+    ) -> ResponsesWebSocketSessionState:
+        self._prune_websocket_sessions()
+        explicit_key, explicit = self._extract_websocket_session_key(request_data)
+        new_session_created = False
+        with self._websocket_sessions_lock:
+            if explicit_key is not None:
+                session = self._websocket_sessions.get(explicit_key)
+                if session is None:
+                    session = ResponsesWebSocketSessionState(
+                        session_id=explicit_key,
+                        explicit_session_key=explicit,
+                    )
+                    self._websocket_sessions[explicit_key] = session
+                    new_session_created = True
+                selected_session = session
+            else:
+                matched_session = self._find_matching_websocket_session(
+                    current_messages=current_messages
+                )
+                if matched_session is not None:
+                    selected_session = matched_session
+                else:
+                    session = ResponsesWebSocketSessionState(
+                        session_id=self._new_websocket_session_id(),
+                        explicit_session_key=False,
+                    )
+                    self._websocket_sessions[session.session_id] = session
+                    selected_session = session
+                    new_session_created = True
+
+        if new_session_created:
+            self._enforce_websocket_session_capacity()
+        return selected_session
+
+    @classmethod
+    def _build_assistant_response_message(
+        cls,
+        *,
+        content: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not content and not tool_calls:
+            return None
+        message: dict[str, Any] = {"role": "assistant"}
+        if content:
+            message["content"] = content
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            message.setdefault("content", "")
+        return message
 
     @classmethod
     def _normalize_strict_schema_node(cls, node: Any) -> Any:
@@ -863,165 +1121,302 @@ class LiteLLMUpstreamAdapter:
             ],
         }
 
+    def _build_openai_responses_websocket_turn_payload(
+        self,
+        *,
+        route: UpstreamRoute,
+        request_data: dict[str, Any],
+        session: ResponsesWebSocketSessionState,
+        current_messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, bool, str | None]:
+        continue_with_previous = False
+        turn_request_data = copy.deepcopy(request_data)
+        previous_messages = session.conversation_messages
+        if (
+            session.last_response_id
+            and previous_messages
+            and self._messages_extend_prefix(previous_messages, current_messages)
+        ):
+            delta_messages = current_messages[len(previous_messages) :]
+            if delta_messages:
+                turn_request_data["messages"] = delta_messages
+                continue_with_previous = True
+            else:
+                self._log(
+                    "OpenAI Responses WebSocket 检测到重复历史，改为新链路: "
+                    f"session={session.session_id}"
+                )
+
+        payload, error = self._build_openai_responses_websocket_request(
+            route=route,
+            request_data=turn_request_data,
+        )
+        if payload is None:
+            return None, False, error
+
+        if continue_with_previous and session.last_response_id:
+            payload["previous_response_id"] = session.last_response_id
+            self._log(
+                "OpenAI Responses WebSocket 续链: "
+                f"session={session.session_id} "
+                f"previous_response_id={session.last_response_id}"
+            )
+        elif session.last_response_id:
+            self._log(
+                "OpenAI Responses WebSocket 改为新链路: "
+                f"session={session.session_id} reason=history_reset"
+            )
+        return payload, continue_with_previous, None
+
+    def _stream_openai_responses_websocket_turn(  # noqa: PLR0912, PLR0915
+        self,
+        *,
+        route: UpstreamRoute,
+        session: ResponsesWebSocketSessionState,
+        payload: dict[str, Any],
+        current_messages: list[dict[str, Any]],
+    ) -> Any:
+        connection = session.connection
+        if connection is None:
+            raise RuntimeError("OpenAI Responses WebSocket 连接未建立")
+
+        response_id = "chatcmpl_websocket_pending"
+        created = 0
+        function_calls: dict[str, ResponsesWebSocketFunctionCallState] = {}
+        saw_function_call = False
+        assistant_content_parts: list[str] = []
+        assistant_tool_calls: list[dict[str, Any]] = []
+
+        def now_ts() -> int:
+            return int(time.time())
+
+        connection.response.create(**payload)
+        for event in connection:
+            event_payload = _coerce_model_dump(event)
+            if event_payload is None:
+                continue
+            event_type_obj = event_payload.get("type")
+            event_type = event_type_obj if isinstance(event_type_obj, str) else ""
+
+            if event_type == "response.created":
+                response_obj = event_payload.get("response")
+                if isinstance(response_obj, dict):
+                    response = cast(dict[str, Any], response_obj)
+                    response_id_obj = response.get("id")
+                    if isinstance(response_id_obj, str) and response_id_obj:
+                        response_id = response_id_obj
+                    created_obj = response.get("created_at")
+                    if isinstance(created_obj, int):
+                        created = created_obj
+                if created <= 0:
+                    created = now_ts()
+                continue
+
+            if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                delta_obj = event_payload.get("delta")
+                if isinstance(delta_obj, str) and delta_obj:
+                    assistant_content_parts.append(delta_obj)
+                    yield self._build_openai_chat_delta_chunk(
+                        response_id=response_id,
+                        created=created or now_ts(),
+                        model=route.litellm_model,
+                        delta={"content": delta_obj},
+                    )
+                continue
+
+            if event_type in {
+                "response.reasoning_text.delta",
+                "response.reasoning_summary_text.delta",
+            }:
+                delta_obj = event_payload.get("delta")
+                if isinstance(delta_obj, str) and delta_obj:
+                    yield self._build_openai_chat_delta_chunk(
+                        response_id=response_id,
+                        created=created or now_ts(),
+                        model=route.litellm_model,
+                        delta={"reasoning_content": delta_obj},
+                    )
+                continue
+
+            if event_type == "response.output_item.added":
+                item_obj = event_payload.get("item")
+                item = cast(dict[str, Any], item_obj) if isinstance(item_obj, dict) else None
+                if not item or item.get("type") != "function_call":
+                    continue
+                item_id_obj = item.get("id")
+                item_id = item_id_obj if isinstance(item_id_obj, str) else ""
+                call_id_obj = item.get("call_id")
+                call_id = call_id_obj if isinstance(call_id_obj, str) and call_id_obj else item_id
+                name_obj = item.get("name")
+                name = name_obj if isinstance(name_obj, str) else ""
+                function_calls[item_id] = ResponsesWebSocketFunctionCallState(
+                    index=len(function_calls),
+                    call_id=call_id,
+                    name=name,
+                )
+                assistant_tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    }
+                )
+                saw_function_call = True
+                yield self._build_openai_chat_delta_chunk(
+                    response_id=response_id,
+                    created=created or now_ts(),
+                    model=route.litellm_model,
+                    delta={"tool_calls": [assistant_tool_calls[-1]]},
+                )
+                continue
+
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+            }:
+                item_id_obj = event_payload.get("item_id")
+                item_id = item_id_obj if isinstance(item_id_obj, str) else ""
+                payload_key = "delta" if event_type.endswith(".delta") else "arguments"
+                delta_obj = event_payload.get(payload_key)
+                if not item_id or not isinstance(delta_obj, str) or not delta_obj:
+                    continue
+                function_call = function_calls.get(item_id)
+                if function_call is None:
+                    continue
+                if event_type.endswith(".done") and function_call.arguments_streamed:
+                    continue
+                function_call.arguments_streamed = True
+                for tool_call in assistant_tool_calls:
+                    if tool_call.get("id") == function_call.call_id:
+                        function_obj = tool_call.get("function")
+                        if isinstance(function_obj, dict):
+                            function_data = cast(dict[str, Any], function_obj)
+                            previous_arguments = function_data.get("arguments")
+                            arguments = (
+                                previous_arguments
+                                if isinstance(previous_arguments, str)
+                                else ""
+                            )
+                            function_data["arguments"] = arguments + delta_obj
+                        break
+                yield self._build_openai_chat_delta_chunk(
+                    response_id=response_id,
+                    created=created or now_ts(),
+                    model=route.litellm_model,
+                    delta={
+                        "tool_calls": [
+                            {
+                                "index": function_call.index,
+                                "id": function_call.call_id,
+                                "type": "function",
+                                "function": {"arguments": delta_obj},
+                            }
+                        ]
+                    },
+                )
+                continue
+
+            if event_type == "response.completed":
+                assistant_message = self._build_assistant_response_message(
+                    content="".join(assistant_content_parts),
+                    tool_calls=assistant_tool_calls,
+                )
+                updated_messages = self._clone_message_list(current_messages)
+                if assistant_message is not None:
+                    updated_messages.append(assistant_message)
+                session.last_response_id = response_id
+                session.conversation_messages = updated_messages
+                session.last_used_at = time.time()
+                yield self._build_openai_chat_delta_chunk(
+                    response_id=response_id,
+                    created=created or now_ts(),
+                    model=route.litellm_model,
+                    delta={},
+                    finish_reason="tool_calls" if saw_function_call else "stop",
+                )
+                return
+
+            if event_type in {"response.failed", "error"}:
+                status_obj = event_payload.get("status")
+                status = status_obj if isinstance(status_obj, int) else None
+                error_obj = event_payload.get("error")
+                error_payload = (
+                    cast(dict[str, Any], error_obj) if isinstance(error_obj, dict) else {}
+                )
+                message_obj = error_payload.get("message")
+                message = (
+                    message_obj.strip()
+                    if isinstance(message_obj, str) and message_obj.strip()
+                    else f"OpenAI Responses WebSocket 返回错误事件: {event_type}"
+                )
+                code_obj = error_payload.get("code")
+                code = code_obj.strip() if isinstance(code_obj, str) and code_obj.strip() else None
+                raise ResponsesWebSocketSessionError(message, code=code, status=status)
+
     def _create_openai_responses_websocket_stream(  # noqa: PLR0915
         self,
         *,
         route: UpstreamRoute,
         request_data: dict[str, Any],
     ) -> Any:
-        payload, error = self._build_openai_responses_websocket_request(
-            route=route,
+        messages_obj = request_data.get("messages")
+        if not isinstance(messages_obj, list):
+            raise ValueError("缺少可转换的 messages 数组")
+        current_messages = self._clone_message_list(cast(list[Any], messages_obj))
+        session = self._get_or_create_websocket_session(
             request_data=request_data,
+            current_messages=current_messages,
         )
-        if payload is None:
-            raise ValueError(error or "无法构造 Responses WebSocket 请求")
-
-        def now_ts() -> int:
-            return int(time.time())
 
         def generate() -> Any:  # noqa: PLR0912, PLR0915
-            response_id = "chatcmpl_websocket_pending"
-            created = 0
-            function_calls: dict[str, ResponsesWebSocketFunctionCallState] = {}
-            saw_function_call = False
-            client = OpenAI(api_key=route.api_key, base_url=route.base_url)
-            with client.responses.connect() as connection:
-                connection.response.create(**payload)
-                for event in connection:
-                    event_payload = _coerce_model_dump(event)
-                    if event_payload is None:
-                        continue
-                    event_type_obj = event_payload.get("type")
-                    event_type = event_type_obj if isinstance(event_type_obj, str) else ""
-
-                    if event_type == "response.created":
-                        response_obj = event_payload.get("response")
-                        if isinstance(response_obj, dict):
-                            response = cast(dict[str, Any], response_obj)
-                            response_id_obj = response.get("id")
-                            if isinstance(response_id_obj, str) and response_id_obj:
-                                response_id = response_id_obj
-                            created_obj = response.get("created_at")
-                            if isinstance(created_obj, int):
-                                created = created_obj
-                        if created <= 0:
-                            created = now_ts()
-                        continue
-
-                    if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-                        delta_obj = event_payload.get("delta")
-                        if isinstance(delta_obj, str) and delta_obj:
-                            yield self._build_openai_chat_delta_chunk(
-                                response_id=response_id,
-                                created=created or now_ts(),
-                                model=route.litellm_model,
-                                delta={"content": delta_obj},
-                            )
-                        continue
-
-                    if event_type in {
-                        "response.reasoning_text.delta",
-                        "response.reasoning_summary_text.delta",
-                    }:
-                        delta_obj = event_payload.get("delta")
-                        if isinstance(delta_obj, str) and delta_obj:
-                            yield self._build_openai_chat_delta_chunk(
-                                response_id=response_id,
-                                created=created or now_ts(),
-                                model=route.litellm_model,
-                                delta={"reasoning_content": delta_obj},
-                            )
-                        continue
-
-                    if event_type == "response.output_item.added":
-                        item_obj = event_payload.get("item")
-                        item = (
-                            cast(dict[str, Any], item_obj) if isinstance(item_obj, dict) else None
+            with session.lock:
+                for attempt in range(2):
+                    emitted_output = False
+                    self._ensure_websocket_session_connection(session=session, route=route)
+                    payload, _continued, error = (
+                        self._build_openai_responses_websocket_turn_payload(
+                            route=route,
+                            request_data=request_data,
+                            session=session,
+                            current_messages=current_messages,
                         )
-                        if not item or item.get("type") != "function_call":
-                            continue
-                        item_id_obj = item.get("id")
-                        item_id = item_id_obj if isinstance(item_id_obj, str) else ""
-                        call_id_obj = item.get("call_id")
-                        call_id = (
-                            call_id_obj if isinstance(call_id_obj, str) and call_id_obj else item_id
-                        )
-                        name_obj = item.get("name")
-                        name = name_obj if isinstance(name_obj, str) else ""
-                        function_calls[item_id] = ResponsesWebSocketFunctionCallState(
-                            index=len(function_calls),
-                            call_id=call_id,
-                            name=name,
-                        )
-                        saw_function_call = True
-                        yield self._build_openai_chat_delta_chunk(
-                            response_id=response_id,
-                            created=created or now_ts(),
-                            model=route.litellm_model,
-                            delta={
-                                "tool_calls": [
-                                    {
-                                        "index": function_calls[item_id].index,
-                                        "id": call_id,
-                                        "type": "function",
-                                        "function": {"name": name, "arguments": ""},
-                                    }
-                                ]
-                            },
-                        )
-                        continue
+                    )
+                    if payload is None:
+                        raise ValueError(error or "无法构造 Responses WebSocket 请求")
 
-                    if event_type in {
-                        "response.function_call_arguments.delta",
-                        "response.function_call_arguments.done",
-                    }:
-                        item_id_obj = event_payload.get("item_id")
-                        item_id = item_id_obj if isinstance(item_id_obj, str) else ""
-                        payload_key = "delta" if event_type.endswith(".delta") else "arguments"
-                        delta_obj = event_payload.get(payload_key)
-                        if not item_id or not isinstance(delta_obj, str) or not delta_obj:
-                            continue
-                        function_call = function_calls.get(item_id)
-                        if function_call is None:
-                            continue
-                        if event_type.endswith(".done") and function_call.arguments_streamed:
-                            continue
-                        function_call.arguments_streamed = True
-                        yield self._build_openai_chat_delta_chunk(
-                            response_id=response_id,
-                            created=created or now_ts(),
-                            model=route.litellm_model,
-                            delta={
-                                "tool_calls": [
-                                    {
-                                        "index": function_call.index,
-                                        "id": function_call.call_id,
-                                        "type": "function",
-                                        "function": {"arguments": delta_obj},
-                                    }
-                                ]
-                            },
-                        )
-                        continue
-
-                    if event_type == "response.completed":
-                        yield self._build_openai_chat_delta_chunk(
-                            response_id=response_id,
-                            created=created or now_ts(),
-                            model=route.litellm_model,
-                            delta={},
-                            finish_reason="tool_calls" if saw_function_call else "stop",
-                        )
+                    try:
+                        for chunk in self._stream_openai_responses_websocket_turn(
+                            route=route,
+                            session=session,
+                            payload=payload,
+                            current_messages=current_messages,
+                        ):
+                            emitted_output = True
+                            yield chunk
                         return
-
-                    if event_type in {"response.failed", "error"}:
-                        error_obj = event_payload.get("error")
-                        if isinstance(error_obj, dict):
-                            error_payload = cast(dict[str, Any], error_obj)
-                            message_obj = error_payload.get("message")
-                            if isinstance(message_obj, str) and message_obj.strip():
-                                raise RuntimeError(message_obj)
-                        raise RuntimeError(f"OpenAI Responses WebSocket 返回错误事件: {event_type}")
+                    except ResponsesWebSocketSessionError as exc:
+                        session.last_used_at = time.time()
+                        recoverable_codes = {
+                            "previous_response_not_found",
+                            "websocket_connection_limit_reached",
+                        }
+                        if emitted_output or exc.code not in recoverable_codes or attempt >= 1:
+                            raise
+                        self._log(
+                            "OpenAI Responses WebSocket 会话恢复: "
+                            f"session={session.session_id} code={exc.code}"
+                        )
+                        self._reset_websocket_session_chain(session)
+                        self._open_websocket_session_connection(
+                            session=session,
+                            route=route,
+                            reconnect_reason=exc.code,
+                        )
+                        continue
+                    except Exception:
+                        self._close_websocket_session(session)
+                        self._reset_websocket_session_chain(session)
+                        raise
 
         return generate()
 
@@ -1116,7 +1511,13 @@ class LiteLLMUpstreamAdapter:
         )
 
     def close(self) -> None:
-        return None
+        with self._websocket_sessions_lock:
+            sessions = list(self._websocket_sessions.values())
+            self._websocket_sessions = {}
+        for session in sessions:
+            with session.lock:
+                self._close_websocket_session(session)
+                self._reset_websocket_session_chain(session)
 
 
 def normalize_upstream_error(exc: Exception) -> UpstreamErrorInfo:
