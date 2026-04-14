@@ -8,7 +8,6 @@ import yaml
 
 from modules.proxy.proxy_config import (
     OPENAI_CHAT_COMPLETION_PROVIDER,
-    OPENAI_RESPONSE_PROVIDER,
     normalize_model_discovery_strategy,
     normalize_provider,
 )
@@ -36,9 +35,9 @@ CONFIG_GROUP_ALLOWED_KEYS = frozenset(
 
 
 def _should_enable_websocket_mode_by_default(*, provider: str | None, model_id: str | None) -> bool:
-    normalized_provider = normalize_provider(provider if isinstance(provider, str) else None)
-    normalized_model_id = model_id.strip().lower() if isinstance(model_id, str) else ""
-    return normalized_provider == OPENAI_RESPONSE_PROVIDER and normalized_model_id == "gpt-5.4"
+    _ = provider
+    _ = model_id
+    return False
 
 
 def _normalize_config_group(raw_group: Any) -> dict[str, Any] | None:

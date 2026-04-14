@@ -39,7 +39,7 @@ const form = reactive({
   middle_route: "",
   prompt_cache_enabled: false,
   request_params_enabled: true,
-  websocket_mode_enabled: true,
+  websocket_mode_enabled: false,
 });
 
 const PROVIDER_LABELS: Record<ProviderId, string> = {
@@ -49,12 +49,12 @@ const PROVIDER_LABELS: Record<ProviderId, string> = {
   gemini: "Gemini",
 };
 
-const isGpt54ResponsesGroup = (group: Pick<ConfigGroup, "provider" | "model_id">) =>
-  normalizeProvider(group.provider) === "openai_response" &&
+const isGpt54OpenAiGroup = (group: Pick<ConfigGroup, "provider" | "model_id">) =>
+  ["openai_chat_completion", "openai_response"].includes(normalizeProvider(group.provider)) &&
   (group.model_id || "").trim().toLowerCase() === "gpt-5.4";
 
-const isGpt54ResponsesForm = computed(() =>
-  isGpt54ResponsesGroup({
+const isGpt54OpenAiForm = computed(() =>
+  isGpt54OpenAiGroup({
     provider: form.provider,
     model_id: form.model_id,
   }),
@@ -255,7 +255,7 @@ const resetForm = () => {
   form.middle_route = "";
   form.prompt_cache_enabled = false;
   form.request_params_enabled = true;
-  form.websocket_mode_enabled = true;
+  form.websocket_mode_enabled = false;
   middleRouteEnabled.value = false;
   formError.value = "";
   availableModels.value = [];
@@ -287,7 +287,7 @@ const openEdit = () => {
   form.middle_route = group.middle_route || "";
   form.prompt_cache_enabled = group.prompt_cache_enabled ?? false;
   form.request_params_enabled = group.request_params_enabled ?? true;
-  form.websocket_mode_enabled = group.websocket_mode_enabled ?? isGpt54ResponsesGroup(group);
+  form.websocket_mode_enabled = group.websocket_mode_enabled ?? false;
   middleRouteEnabled.value = Boolean(group.middle_route);
   formError.value = "";
   availableModels.value = [];
@@ -331,7 +331,7 @@ const handleSave = async () => {
     api_key: form.api_key.trim(),
     prompt_cache_enabled: form.prompt_cache_enabled,
     request_params_enabled: form.request_params_enabled,
-    websocket_mode_enabled: isGpt54ResponsesForm.value ? form.websocket_mode_enabled : false,
+    websocket_mode_enabled: isGpt54OpenAiForm.value ? form.websocket_mode_enabled : false,
   };
 
   if (!payload.api_url || !payload.model_id || !payload.api_key) {
@@ -705,7 +705,7 @@ const moveDown = async () => {
                 关闭“带上请求参数”后，运行代理与测活都会尽量去掉 temperature、top_p 等额外参数。
               </div>
               <div v-if="configGroups[selectedIndex]?.websocket_mode_enabled">
-                当前配置会在 `OpenAI Response + gpt-5.4` 的流式请求里优先尝试上游 WebSocket 模式。
+                当前配置会在 `OpenAI + gpt-5.4` 的流式请求里优先尝试上游 WebSocket 模式。
               </div>
             </div>
           </template>

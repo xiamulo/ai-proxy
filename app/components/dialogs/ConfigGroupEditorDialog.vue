@@ -115,7 +115,9 @@ const websocketModeEnabledModel = computed({
 });
 
 const showWebsocketModeOption = computed(
-  () => props.provider === "openai_response" && props.modelId.trim().toLowerCase() === "gpt-5.4",
+  () =>
+    (props.provider === "openai_chat_completion" || props.provider === "openai_response") &&
+    props.modelId.trim().toLowerCase() === "gpt-5.4",
 );
 
 const handleDialogClose = () => {
@@ -266,8 +268,8 @@ const providerOptions: { label: string; value: ProviderId }[] = [
             <span class="label-text text-sm font-medium text-slate-300">启用 WebSocket 模式</span>
           </label>
           <p class="text-xs leading-5 text-slate-400">
-            仅对 `OpenAI Response + gpt-5.4` 生效。开启后，代理会优先尝试使用 OpenAI Responses
-            WebSocket 模式来处理流式请求。
+            仅对 `OpenAI + gpt-5.4` 生效。开启后，流式请求会优先尝试使用 OpenAI Responses WebSocket
+            模式；连接失败时会自动回退到普通 HTTP。
           </p>
         </template>
       </div>

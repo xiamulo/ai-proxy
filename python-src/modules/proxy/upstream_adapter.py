@@ -347,8 +347,8 @@ class LiteLLMUpstreamAdapter:
     ) -> tuple[bool, str | None]:
         if not route.websocket_mode_enabled:
             return False, "配置组未启用 WebSocket 模式"
-        if route.provider != OPENAI_RESPONSE_PROVIDER:
-            return False, "仅 OpenAI Response 配置支持 WebSocket 模式"
+        if route.provider not in OPENAI_PROVIDER_IDS:
+            return False, "仅 OpenAI 配置支持 WebSocket 模式"
         if route.litellm_model.strip().lower() != OPENAI_RESPONSES_WEBSOCKET_MODEL_ID:
             return False, "当前模型不是 gpt-5.4"
         if not bool(request_data.get("stream", False)):
@@ -464,6 +464,43 @@ class LiteLLMUpstreamAdapter:
         return f"call_legacy_{index}"
 
     @classmethod
+    def _normalize_strict_schema_node(cls, node: Any) -> Any:
+        if isinstance(node, list):
+            return [cls._normalize_strict_schema_node(item) for item in cast(list[Any], node)]
+        if not isinstance(node, dict):
+            return node
+
+        normalized = {
+            key: cls._normalize_strict_schema_node(value)
+            for key, value in cast(dict[str, Any], node).items()
+        }
+        type_obj = normalized.get("type")
+        is_object_type = type_obj == "object" or (
+            isinstance(type_obj, list) and "object" in type_obj
+        )
+        properties_obj = normalized.get("properties")
+
+        if is_object_type:
+            normalized["additionalProperties"] = False
+            if isinstance(properties_obj, dict):
+                normalized["required"] = list(cast(dict[str, Any], properties_obj).keys())
+
+        return normalized
+
+    @classmethod
+    def _normalize_strict_function_parameters(
+        cls, parameters: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if parameters is None:
+            return {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            }
+        return cast(dict[str, Any], cls._normalize_strict_schema_node(parameters))
+
+    @classmethod
     def _convert_function_tool_definition(cls, definition: dict[str, Any]) -> dict[str, Any] | None:
         name_obj = definition.get("name")
         if not isinstance(name_obj, str) or not name_obj.strip():
@@ -474,6 +511,10 @@ class LiteLLMUpstreamAdapter:
         )
         strict_obj = definition.get("strict")
         strict = strict_obj if isinstance(strict_obj, bool) else True
+        if strict:
+            parameters = cls._normalize_strict_function_parameters(
+                cast(dict[str, Any] | None, parameters)
+            )
         tool: dict[str, Any] = {
             "type": "function",
             "name": name_obj,

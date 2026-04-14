@@ -234,7 +234,7 @@ def normalize_websocket_mode_enabled(
     normalized_provider = normalize_provider(provider)
     normalized_model_id = model_id.strip().lower() if isinstance(model_id, str) else ""
     return (
-        normalized_provider == OPENAI_RESPONSE_PROVIDER
+        normalized_provider in OPENAI_PROVIDER_IDS
         and normalized_model_id == OPENAI_RESPONSES_WEBSOCKET_MODEL_ID
     )
 

@@ -78,10 +78,10 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
         self.assertTrue(normalized["request_params_enabled"])
         self.assertFalse(normalized["websocket_mode_enabled"])
 
-    def test_normalize_config_group_defaults_websocket_mode_for_gpt_5_4_responses(self) -> None:
+    def test_normalize_config_group_defaults_websocket_mode_to_false(self) -> None:
         normalized = _normalize_config_group(
             {
-                "provider": "openai_response",
+                "provider": "openai_chat_completion",
                 "api_url": "https://api.openai.com",
                 "model_id": "gpt-5.4",
                 "api_key": "test-key",
@@ -90,7 +90,7 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
 
         self.assertIsNotNone(normalized)
         assert normalized is not None
-        self.assertTrue(normalized["websocket_mode_enabled"])
+        self.assertFalse(normalized["websocket_mode_enabled"])
 
     def test_collect_config_warnings_reports_legacy_group_mapped_model_id(self) -> None:
         warnings = _collect_config_warnings(

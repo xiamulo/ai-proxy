@@ -292,6 +292,47 @@ class UpstreamAdapterTests(unittest.TestCase):
             any("流式请求优先使用 OpenAI Responses WebSocket 模式" in item for item in logs)
         )
 
+    def test_openai_chat_completion_gpt_5_4_stream_also_uses_websocket_mode(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_CHAT_COMPLETION_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+
+        with (
+            patch.object(
+                adapter,
+                "_create_openai_responses_websocket_stream",
+                return_value=iter([]),
+            ) as websocket_mock,
+            patch(
+                "modules.proxy.upstream_adapter._create_litellm_completion",
+            ) as completion_mock,
+        ):
+            stream = adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "stream": True,
+                },
+            )
+            chunks = list(stream)
+
+        self.assertEqual(chunks, [])
+        websocket_mock.assert_called_once()
+        completion_mock.assert_not_called()
+        self.assertTrue(
+            any("流式请求优先使用 OpenAI Responses WebSocket 模式" in item for item in logs)
+        )
+
     def test_openai_response_gpt_5_4_stream_falls_back_to_http_when_websocket_connection_fails(
         self,
     ) -> None:
@@ -400,6 +441,8 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertEqual(payload["instructions"], "系统提示")
         self.assertEqual(payload["tool_choice"], {"type": "function", "name": "summarize"})
         self.assertEqual(payload["tools"][0]["type"], "function")
+        self.assertEqual(payload["tools"][0]["parameters"]["additionalProperties"], False)
+        self.assertEqual(payload["tools"][0]["parameters"]["required"], ["result"])
         input_items = payload["input"]
         self.assertEqual(input_items[0]["role"], "user")
         self.assertEqual(input_items[1]["type"], "function_call")
@@ -491,6 +534,101 @@ class UpstreamAdapterTests(unittest.TestCase):
             '{"city":"上海"}',
         )
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_websocket_request_normalizes_strict_function_schema_recursively(self) -> None:
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        payload, error = LiteLLMUpstreamAdapter._build_openai_responses_websocket_request(
+            route=route,
+            request_data={
+                "messages": [{"role": "user", "content": "创建任务"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Task",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "meta": {
+                                        "type": "object",
+                                        "properties": {
+                                            "priority": {"type": "string"},
+                                            "tags": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "name": {"type": "string"},
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertIsNone(error)
+        assert payload is not None
+        parameters = payload["tools"][0]["parameters"]
+        self.assertEqual(parameters["additionalProperties"], False)
+        self.assertEqual(parameters["required"], ["title", "meta"])
+        self.assertEqual(parameters["properties"]["meta"]["additionalProperties"], False)
+        self.assertEqual(parameters["properties"]["meta"]["required"], ["priority", "tags"])
+        self.assertEqual(
+            parameters["properties"]["meta"]["properties"]["tags"]["items"]["additionalProperties"],
+            False,
+        )
+        self.assertEqual(
+            parameters["properties"]["meta"]["properties"]["tags"]["items"]["required"],
+            ["name"],
+        )
+
+    def test_websocket_request_keeps_non_strict_function_schema_unchanged(self) -> None:
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        payload, error = LiteLLMUpstreamAdapter._build_openai_responses_websocket_request(
+            route=route,
+            request_data={
+                "messages": [{"role": "user", "content": "创建任务"}],
+                "functions": [
+                    {
+                        "name": "Task",
+                        "strict": False,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertIsNone(error)
+        assert payload is not None
+        parameters = payload["tools"][0]["parameters"]
+        self.assertNotIn("additionalProperties", parameters)
+        self.assertNotIn("required", parameters)
 
 
 if __name__ == "__main__":
