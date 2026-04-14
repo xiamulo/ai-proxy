@@ -787,7 +787,9 @@ class ProxyApp:
                     )
 
                     try:
-                        for chunk in response_from_target:
+                        for chunk in transport.iter_coalesced_openai_text_chunks(
+                            response_from_target
+                        ):
                             normalized_chunk = transport.normalize_chat_completion_payload(
                                 chunk,
                                 provider=route.provider,

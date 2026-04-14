@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 
 import litellm
 from openai import OpenAI
+from openai.types.websocket_connection_options import WebSocketConnectionOptions
 
 from modules.proxy.proxy_config import (
     OPENAI_CHAT_COMPLETION_PROVIDER,
@@ -39,6 +40,10 @@ WEBSOCKET_SESSION_IDLE_TIMEOUT_SECONDS = 15 * 60
 WEBSOCKET_SESSION_MAX_COUNT = 64
 OPENAI_STRICT_SCHEMA_SELF_HEAL_MAX_ATTEMPTS = 4
 OPENAI_UNSUPPORTED_PARAM_SELF_HEAL_MAX_ATTEMPTS = 4
+OPENAI_RESPONSES_WEBSOCKET_CONNECTION_OPTIONS: dict[str, Any] = {
+    "ping_interval": None,
+    "max_size": None,
+}
 OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS: frozenset[str] = frozenset(
     {
         "allOf",
@@ -673,7 +678,12 @@ class LiteLLMUpstreamAdapter:
             )
         self._close_websocket_session(session)
         client = OpenAI(api_key=route.api_key, base_url=route.base_url)
-        connection_context = client.responses.connect()
+        connection_context = client.responses.connect(
+            websocket_connection_options=cast(
+                WebSocketConnectionOptions,
+                OPENAI_RESPONSES_WEBSOCKET_CONNECTION_OPTIONS,
+            )
+        )
         connection = connection_context.__enter__()
         now = time.time()
         session.client = client
@@ -707,7 +717,7 @@ class LiteLLMUpstreamAdapter:
         self,
         *,
         current_messages: list[dict[str, Any]],
-    ) -> ResponsesWebSocketSessionState | None:
+    ) -> tuple[ResponsesWebSocketSessionState | None, int, int]:
         best_session: ResponsesWebSocketSessionState | None = None
         best_prefix_len = -1
         best_match_count = 0
@@ -725,8 +735,8 @@ class LiteLLMUpstreamAdapter:
             if prefix_len == best_prefix_len:
                 best_match_count += 1
         if best_match_count == 1:
-            return best_session
-        return None
+            return best_session, best_prefix_len, best_match_count
+        return None, best_prefix_len, best_match_count
 
     def _get_or_create_websocket_session(
         self,
@@ -737,6 +747,9 @@ class LiteLLMUpstreamAdapter:
         self._prune_websocket_sessions()
         explicit_key, explicit = self._extract_websocket_session_key(request_data)
         new_session_created = False
+        selection_reason = "unknown"
+        matched_prefix_len = 0
+        matched_candidates = 0
         with self._websocket_sessions_lock:
             if explicit_key is not None:
                 session = self._websocket_sessions.get(explicit_key)
@@ -747,13 +760,19 @@ class LiteLLMUpstreamAdapter:
                     )
                     self._websocket_sessions[explicit_key] = session
                     new_session_created = True
+                    selection_reason = "explicit_new"
+                else:
+                    selection_reason = "explicit_reuse"
                 selected_session = session
             else:
-                matched_session = self._find_matching_websocket_session(
-                    current_messages=current_messages
+                matched_session, matched_prefix_len, matched_candidates = (
+                    self._find_matching_websocket_session(
+                        current_messages=current_messages
+                    )
                 )
                 if matched_session is not None:
                     selected_session = matched_session
+                    selection_reason = "matched_prefix"
                 else:
                     session = ResponsesWebSocketSessionState(
                         session_id=self._new_websocket_session_id(),
@@ -762,9 +781,23 @@ class LiteLLMUpstreamAdapter:
                     self._websocket_sessions[session.session_id] = session
                     selected_session = session
                     new_session_created = True
+                    selection_reason = (
+                        "ambiguous_prefix_new"
+                        if matched_candidates > 1
+                        else "new_anonymous"
+                    )
 
         if new_session_created:
             self._enforce_websocket_session_capacity()
+        self._log(
+            "OpenAI Responses WebSocket 会话选择: "
+            f"session={selected_session.session_id} "
+            f"reason={selection_reason} "
+            f"explicit={selected_session.explicit_session_key} "
+            f"message_count={len(current_messages)} "
+            f"matched_prefix_len={max(matched_prefix_len, 0)} "
+            f"matched_candidates={matched_candidates}"
+        )
         return selected_session
 
     @classmethod

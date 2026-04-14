@@ -13,6 +13,7 @@ from modules.proxy.upstream_adapter import LiteLLMUpstreamAdapter
 from modules.runtime.resource_manager import ResourceManager
 
 type LogFunc = Callable[[str], None]
+STREAM_TEXT_COALESCE_TARGET_CHARS = 24
 
 
 class ProxyTransport:
@@ -206,6 +207,108 @@ class ProxyTransport:
     @staticmethod
     def _new_request_id(prefix: str = "resp") -> str:
         return f"{prefix}_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _extract_mergeable_text_choice(
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+        choices_obj = payload.get("choices")
+        if not isinstance(choices_obj, list):
+            return None
+        choices = cast(list[Any], choices_obj)
+        if len(choices) != 1:
+            return None
+
+        choice_obj = choices[0]
+        if not isinstance(choice_obj, dict):
+            return None
+        choice = cast(dict[str, Any], choice_obj)
+
+        finish_reason = choice.get("finish_reason")
+        delta_obj = choice.get("delta")
+        if finish_reason not in (None, "") or not isinstance(delta_obj, dict):
+            return None
+
+        delta = cast(dict[str, Any], delta_obj)
+        content_obj = delta.get("content")
+        has_only_text_keys = all(key in {"role", "content"} for key in delta)
+        if not isinstance(content_obj, str) or not content_obj or not has_only_text_keys:
+            return None
+
+        return choice, delta, content_obj
+
+    @staticmethod
+    def _can_merge_text_payloads(
+        pending_payload: dict[str, Any],
+        current_payload: dict[str, Any],
+    ) -> bool:
+        pending_choice_info = ProxyTransport._extract_mergeable_text_choice(pending_payload)
+        current_choice_info = ProxyTransport._extract_mergeable_text_choice(current_payload)
+        if pending_choice_info is None or current_choice_info is None:
+            return False
+        pending_choice, _pending_delta, _pending_text = pending_choice_info
+        current_choice, _current_delta, _current_text = current_choice_info
+        return (
+            pending_payload.get("id") == current_payload.get("id")
+            and pending_payload.get("model") == current_payload.get("model")
+            and pending_payload.get("created") == current_payload.get("created")
+            and pending_choice.get("index", 0) == current_choice.get("index", 0)
+        )
+
+    def iter_coalesced_openai_text_chunks(
+        self,
+        chunks: Any,
+        *,
+        target_chars: int = STREAM_TEXT_COALESCE_TARGET_CHARS,
+    ) -> Any:
+        pending_payload: dict[str, Any] | None = None
+        pending_chars = 0
+
+        for chunk in chunks:
+            payload = self.coerce_payload_dict(chunk)
+            if payload is None:
+                if pending_payload is not None:
+                    yield pending_payload
+                    pending_payload = None
+                    pending_chars = 0
+                yield chunk
+                continue
+
+            mergeable = self._extract_mergeable_text_choice(payload)
+            if mergeable is None:
+                if pending_payload is not None:
+                    yield pending_payload
+                    pending_payload = None
+                    pending_chars = 0
+                yield chunk
+                continue
+
+            _choice, _delta, text = mergeable
+            if pending_payload is None:
+                pending_payload = copy.deepcopy(payload)
+                pending_chars = len(text)
+            elif self._can_merge_text_payloads(pending_payload, payload):
+                pending_delta = cast(
+                    dict[str, Any],
+                    cast(list[Any], pending_payload["choices"])[0]["delta"],
+                )
+                pending_text = pending_delta.get("content")
+                pending_delta["content"] = (
+                    pending_text if isinstance(pending_text, str) else ""
+                ) + text
+                pending_chars += len(text)
+            else:
+                yield pending_payload
+                pending_payload = copy.deepcopy(payload)
+                pending_chars = len(text)
+
+            if pending_chars >= target_chars:
+                yield pending_payload
+                pending_payload = None
+                pending_chars = 0
+
+        if pending_payload is not None:
+            yield pending_payload
 
     @staticmethod
     def _split_text_chunks(text: str, *, chunk_size: int = 10) -> list[str]:

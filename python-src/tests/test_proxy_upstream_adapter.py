@@ -207,6 +207,66 @@ class UpstreamAdapterTests(unittest.TestCase):
         responses_http_mock.assert_called_once()
         completion_mock.assert_not_called()
 
+    def test_websocket_connection_uses_long_response_safe_options(self) -> None:
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=lambda _message: None,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        session = ResponsesWebSocketSessionState(
+            session_id="session-1",
+            explicit_session_key=True,
+        )
+        fake_connection = object()
+        fake_client = type(
+            "FakeClient",
+            (),
+            {
+                "responses": type(
+                    "FakeResponses",
+                    (),
+                    {
+                        "connect": lambda self, **kwargs: connect_mock(**kwargs),
+                    },
+                )()
+            },
+        )()
+        connect_kwargs: dict[str, Any] = {}
+
+        class FakeConnectionContext:
+            def __enter__(self) -> Any:
+                return fake_connection
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        def connect_mock(**kwargs: Any) -> Any:
+            connect_kwargs.update(kwargs)
+            return FakeConnectionContext()
+
+        with patch("modules.proxy.upstream_adapter.OpenAI", return_value=fake_client):
+            adapter._open_websocket_session_connection(
+                session=session,
+                route=route,
+                reconnect_reason="initial_connect",
+            )
+
+        self.assertEqual(
+            connect_kwargs["websocket_connection_options"]["ping_interval"],
+            None,
+        )
+        self.assertEqual(
+            connect_kwargs["websocket_connection_options"]["max_size"],
+            None,
+        )
+
     def test_openai_compatible_request_drops_optional_params_when_disabled(self) -> None:
         adapter = LiteLLMUpstreamAdapter(
             disable_ssl_strict_mode=False,
@@ -534,7 +594,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return iter(events)
 
         class FakeResponses:
-            def connect(self) -> FakeConnection:
+            def connect(self, **kwargs: Any) -> FakeConnection:
                 return FakeConnection()
 
         class FakeClient:
@@ -617,7 +677,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -707,7 +767,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -793,7 +853,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -899,7 +959,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -991,7 +1051,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -1052,9 +1112,10 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertIn("fresh", adapter._websocket_sessions)
 
     def test_websocket_session_ambiguous_prefix_creates_new_session(self) -> None:
+        logs: list[str] = []
         adapter = LiteLLMUpstreamAdapter(
             disable_ssl_strict_mode=False,
-            log_func=lambda _message: None,
+            log_func=logs.append,
         )
         shared_messages = [
             {"role": "user", "content": "hello"},
@@ -1063,11 +1124,13 @@ class UpstreamAdapterTests(unittest.TestCase):
         session_a = ResponsesWebSocketSessionState(
             session_id="session-a",
             explicit_session_key=False,
+            last_used_at=time.time(),
             conversation_messages=shared_messages,
         )
         session_b = ResponsesWebSocketSessionState(
             session_id="session-b",
             explicit_session_key=False,
+            last_used_at=time.time(),
             conversation_messages=shared_messages,
         )
         adapter._websocket_sessions = {
@@ -1091,6 +1154,52 @@ class UpstreamAdapterTests(unittest.TestCase):
         )
 
         self.assertNotIn(selected_session.session_id, {"session-a", "session-b"})
+        self.assertTrue(any("reason=ambiguous_prefix_new" in item for item in logs))
+
+    def test_websocket_session_logs_explicit_and_matched_selection_reason(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+
+        explicit_session = adapter._get_or_create_websocket_session(
+            request_data={
+                "metadata": {"session_id": "session-explicit"},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            current_messages=[{"role": "user", "content": "hello"}],
+        )
+        self.assertEqual(explicit_session.session_id, "session-explicit")
+
+        matched_session = ResponsesWebSocketSessionState(
+            session_id="session-matched",
+            explicit_session_key=False,
+            last_used_at=time.time(),
+            conversation_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        )
+        adapter._websocket_sessions[matched_session.session_id] = matched_session
+        reused_session = adapter._get_or_create_websocket_session(
+            request_data={
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                    {"role": "user", "content": "continue"},
+                ]
+            },
+            current_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        self.assertEqual(reused_session.session_id, "session-matched")
+        self.assertTrue(any("reason=explicit_new" in item for item in logs))
+        self.assertTrue(any("reason=matched_prefix" in item for item in logs))
 
     def test_websocket_request_normalizes_strict_function_schema_recursively(self) -> None:
         route = build_upstream_route(
@@ -1387,7 +1496,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
@@ -1494,7 +1603,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 return None
 
         class FakeResponses:
-            def connect(self) -> FakeConnectionContext:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
                 return FakeConnectionContext()
 
         class FakeClient:
