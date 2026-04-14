@@ -8,6 +8,7 @@ import yaml
 
 from modules.proxy.proxy_config import (
     OPENAI_CHAT_COMPLETION_PROVIDER,
+    OPENAI_RESPONSE_PROVIDER,
     normalize_model_discovery_strategy,
     normalize_provider,
 )
@@ -29,8 +30,15 @@ CONFIG_GROUP_ALLOWED_KEYS = frozenset(
         "model_discovery_strategy",
         "prompt_cache_enabled",
         "request_params_enabled",
+        "websocket_mode_enabled",
     }
 )
+
+
+def _should_enable_websocket_mode_by_default(*, provider: str | None, model_id: str | None) -> bool:
+    normalized_provider = normalize_provider(provider if isinstance(provider, str) else None)
+    normalized_model_id = model_id.strip().lower() if isinstance(model_id, str) else ""
+    return normalized_provider == OPENAI_RESPONSE_PROVIDER and normalized_model_id == "gpt-5.4"
 
 
 def _normalize_config_group(raw_group: Any) -> dict[str, Any] | None:
@@ -74,6 +82,22 @@ def _normalize_config_group(raw_group: Any) -> dict[str, Any] | None:
         normalized["request_params_enabled"] = request_params_enabled
     else:
         normalized["request_params_enabled"] = True
+
+    websocket_mode_enabled = normalized.get("websocket_mode_enabled")
+    if isinstance(websocket_mode_enabled, str):
+        normalized["websocket_mode_enabled"] = websocket_mode_enabled.strip().lower() not in {
+            "false",
+            "0",
+            "off",
+            "no",
+        }
+    elif isinstance(websocket_mode_enabled, bool):
+        normalized["websocket_mode_enabled"] = websocket_mode_enabled
+    else:
+        normalized["websocket_mode_enabled"] = _should_enable_websocket_mode_by_default(
+            provider=cast(str | None, normalized.get("provider")),
+            model_id=cast(str | None, normalized.get("model_id")),
+        )
     return normalized
 
 

@@ -14,6 +14,7 @@ const props = withDefaults(
     middleRouteEnabled?: boolean;
     promptCacheEnabled?: boolean;
     requestParamsEnabled?: boolean;
+    websocketModeEnabled?: boolean;
     formError?: string;
     defaultMiddleRoute?: string;
     availableModels?: string[];
@@ -32,6 +33,7 @@ const props = withDefaults(
     middleRouteEnabled: false,
     promptCacheEnabled: false,
     requestParamsEnabled: true,
+    websocketModeEnabled: true,
     formError: "",
     defaultMiddleRoute: "/v1",
     availableModels: () => [],
@@ -51,6 +53,7 @@ const emit = defineEmits<{
   (event: "update:middleRouteEnabled", value: boolean): void;
   (event: "update:promptCacheEnabled", value: boolean): void;
   (event: "update:requestParamsEnabled", value: boolean): void;
+  (event: "update:websocketModeEnabled", value: boolean): void;
   (event: "save"): void;
   (event: "cancel"): void;
   (event: "fetch-models"): void;
@@ -106,6 +109,15 @@ const requestParamsEnabledModel = computed({
   set: (value: boolean) => emit("update:requestParamsEnabled", value),
 });
 
+const websocketModeEnabledModel = computed({
+  get: () => props.websocketModeEnabled,
+  set: (value: boolean) => emit("update:websocketModeEnabled", value),
+});
+
+const showWebsocketModeOption = computed(
+  () => props.provider === "openai_response" && props.modelId.trim().toLowerCase() === "gpt-5.4",
+);
+
 const handleDialogClose = () => {
   emit("cancel");
 };
@@ -122,26 +134,12 @@ const handleSave = () => {
   emit("save");
 };
 
-const handleFetchModels = () => {
-  emit("fetch-models");
-};
-
 const providerOptions: { label: string; value: ProviderId }[] = [
   { label: "OpenAI Chat Completion", value: "openai_chat_completion" },
   { label: "OpenAI Response", value: "openai_response" },
   { label: "Anthropic", value: "anthropic" },
   { label: "Gemini", value: "gemini" },
 ];
-
-const getModelPlaceholder = (provider: ProviderId) => {
-  if (provider === "anthropic") {
-    return "例如：claude-3-7-sonnet-latest";
-  }
-  if (provider === "gemini") {
-    return "例如：gemini-2.5-pro";
-  }
-  return "例如：gpt-5";
-};
 </script>
 
 <template>
@@ -255,6 +253,23 @@ const getModelPlaceholder = (provider: ProviderId) => {
           默认保持和之前一致，会透传 temperature、top_p
           等请求参数；关闭后仅发送基础消息字段，适合旧模型或兼容性较差的上游。
         </p>
+
+        <template v-if="showWebsocketModeOption">
+          <div class="divider my-2 border-slate-700"></div>
+
+          <label class="flex cursor-pointer items-center gap-2">
+            <input
+              v-model="websocketModeEnabledModel"
+              type="checkbox"
+              class="toggle toggle-xs toggle-info"
+            />
+            <span class="label-text text-sm font-medium text-slate-300">启用 WebSocket 模式</span>
+          </label>
+          <p class="text-xs leading-5 text-slate-400">
+            仅对 `OpenAI Response + gpt-5.4` 生效。开启后，代理会优先尝试使用 OpenAI Responses
+            WebSocket 模式来处理流式请求。
+          </p>
+        </template>
       </div>
       <div
         v-if="props.formError"

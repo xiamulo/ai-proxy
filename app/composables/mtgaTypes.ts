@@ -10,6 +10,7 @@ export type ConfigGroup = {
   model_discovery_strategy?: string;
   prompt_cache_enabled?: boolean;
   request_params_enabled?: boolean;
+  websocket_mode_enabled?: boolean;
 };
 
 export type ConfigPayload = {

@@ -39,6 +39,7 @@ const form = reactive({
   middle_route: "",
   prompt_cache_enabled: false,
   request_params_enabled: true,
+  websocket_mode_enabled: true,
 });
 
 const PROVIDER_LABELS: Record<ProviderId, string> = {
@@ -47,6 +48,17 @@ const PROVIDER_LABELS: Record<ProviderId, string> = {
   anthropic: "Anthropic",
   gemini: "Gemini",
 };
+
+const isGpt54ResponsesGroup = (group: Pick<ConfigGroup, "provider" | "model_id">) =>
+  normalizeProvider(group.provider) === "openai_response" &&
+  (group.model_id || "").trim().toLowerCase() === "gpt-5.4";
+
+const isGpt54ResponsesForm = computed(() =>
+  isGpt54ResponsesGroup({
+    provider: form.provider,
+    model_id: form.model_id,
+  }),
+);
 
 const normalizeProvider = (provider?: string): ProviderId => {
   if (
@@ -68,14 +80,6 @@ const getDefaultMiddleRoute = (provider: ProviderId) =>
   provider === "gemini" ? GEMINI_DEFAULT_MIDDLE_ROUTE : DEFAULT_MIDDLE_ROUTE;
 
 const supportsModelDiscovery = (_provider: ProviderId) => true;
-
-const testTooltip = [
-  "测试选中配置组的实际对话功能",
-  "会发送最小请求并消耗少量tokens",
-  "请确保配置正确后使用",
-].join("\n");
-
-const refreshTooltip = ["重新加载配置文件中的配置组", "用于同步外部修改或恢复意外更改"].join("\n");
 
 const selectedIndex = computed({
   get: () => (configGroups.value.length ? currentIndex.value : -1),
@@ -251,6 +255,7 @@ const resetForm = () => {
   form.middle_route = "";
   form.prompt_cache_enabled = false;
   form.request_params_enabled = true;
+  form.websocket_mode_enabled = true;
   middleRouteEnabled.value = false;
   formError.value = "";
   availableModels.value = [];
@@ -282,6 +287,7 @@ const openEdit = () => {
   form.middle_route = group.middle_route || "";
   form.prompt_cache_enabled = group.prompt_cache_enabled ?? false;
   form.request_params_enabled = group.request_params_enabled ?? true;
+  form.websocket_mode_enabled = group.websocket_mode_enabled ?? isGpt54ResponsesGroup(group);
   middleRouteEnabled.value = Boolean(group.middle_route);
   formError.value = "";
   availableModels.value = [];
@@ -325,6 +331,7 @@ const handleSave = async () => {
     api_key: form.api_key.trim(),
     prompt_cache_enabled: form.prompt_cache_enabled,
     request_params_enabled: form.request_params_enabled,
+    websocket_mode_enabled: isGpt54ResponsesForm.value ? form.websocket_mode_enabled : false,
   };
 
   if (!payload.api_url || !payload.model_id || !payload.api_key) {
@@ -643,6 +650,9 @@ const moveDown = async () => {
                   >透传参数</span
                 >
                 <span v-else class="mtga-chip">精简参数</span>
+                <span v-if="configGroups[selectedIndex]?.websocket_mode_enabled" class="mtga-chip"
+                  >WebSocket</span
+                >
               </div>
             </div>
 
@@ -694,6 +704,9 @@ const moveDown = async () => {
               <div>
                 关闭“带上请求参数”后，运行代理与测活都会尽量去掉 temperature、top_p 等额外参数。
               </div>
+              <div v-if="configGroups[selectedIndex]?.websocket_mode_enabled">
+                当前配置会在 `OpenAI Response + gpt-5.4` 的流式请求里优先尝试上游 WebSocket 模式。
+              </div>
             </div>
           </template>
           <div
@@ -732,6 +745,7 @@ const moveDown = async () => {
     v-model:middle-route-enabled="middleRouteEnabled"
     v-model:prompt-cache-enabled="form.prompt_cache_enabled"
     v-model:request-params-enabled="form.request_params_enabled"
+    v-model:websocket-mode-enabled="form.websocket_mode_enabled"
     :mode="editorMode"
     :form-error="formError"
     :default-middle-route="getDefaultMiddleRoute(form.provider)"

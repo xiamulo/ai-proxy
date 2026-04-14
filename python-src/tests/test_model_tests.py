@@ -65,6 +65,7 @@ class GenerationTestViaLiteLLMTests(unittest.TestCase):
                     api_key="test-key",
                     prompt_cache_enabled=True,
                     request_params_enabled=True,
+                    websocket_mode_enabled=False,
                     middle_route_applied=False,
                     middle_route_ignored=False,
                 )
@@ -100,7 +101,8 @@ class GenerationTestViaLiteLLMTests(unittest.TestCase):
                     {
                         "model": model_id,
                         "messages": [{"role": "user", "content": "你是谁"}],
-                        "max_tokens": 1,
+                        "max_tokens": 16,
+                        "stream": True,
                         "temperature": 0,
                     },
                 )
@@ -119,6 +121,7 @@ class GenerationTestViaLiteLLMTests(unittest.TestCase):
             api_key="test-key",
             prompt_cache_enabled=True,
             request_params_enabled=False,
+            websocket_mode_enabled=False,
             middle_route_applied=False,
             middle_route_ignored=False,
         )
@@ -158,7 +161,8 @@ class GenerationTestViaLiteLLMTests(unittest.TestCase):
             {
                 "model": "claude-3-5-haiku-20241022",
                 "messages": [{"role": "user", "content": "你是谁"}],
-                "max_tokens": 1,
+                "max_tokens": 16,
+                "stream": True,
             },
         )
 
@@ -173,6 +177,7 @@ class GenerationTestViaLiteLLMTests(unittest.TestCase):
             api_key="test-key",
             prompt_cache_enabled=True,
             request_params_enabled=True,
+            websocket_mode_enabled=False,
             middle_route_applied=False,
             middle_route_ignored=False,
             model_discovery_strategy=GEMINI_NATIVE_X_GOOG_API_KEY_MODEL_DISCOVERY,

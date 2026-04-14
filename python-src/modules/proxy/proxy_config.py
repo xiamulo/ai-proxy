@@ -22,6 +22,7 @@ OPENAI_PROVIDER_IDS = (
     OPENAI_CHAT_COMPLETION_PROVIDER,
     OPENAI_RESPONSE_PROVIDER,
 )
+OPENAI_RESPONSES_WEBSOCKET_MODEL_ID = "gpt-5.4"
 OPENAI_COMPATIBLE_MODEL_DISCOVERY = "openai_compatible_bearer"
 ANTHROPIC_NATIVE_MODEL_DISCOVERY = "anthropic_native"
 GEMINI_NATIVE_X_GOOG_API_KEY_MODEL_DISCOVERY = "gemini_native_x_goog_api_key"
@@ -58,6 +59,7 @@ class ProxyConfig:
     prompt_cache_bucket_id: str = ""
     prompt_cache_enabled: bool = True
     request_params_enabled: bool = True
+    websocket_mode_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,24 @@ def normalize_request_params_enabled(value: Any) -> bool:
     return bool(value) if value is not None else True
 
 
+def normalize_websocket_mode_enabled(
+    value: Any,
+    *,
+    provider: str | None,
+    model_id: str | None,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "off", "no"}
+    normalized_provider = normalize_provider(provider)
+    normalized_model_id = model_id.strip().lower() if isinstance(model_id, str) else ""
+    return (
+        normalized_provider == OPENAI_RESPONSE_PROVIDER
+        and normalized_model_id == OPENAI_RESPONSES_WEBSOCKET_MODEL_ID
+    )
+
+
 def provider_supports_model_discovery(value: str | None) -> bool:
     return normalize_provider(value) in SUPPORTED_PROVIDER_IDS
 
@@ -278,11 +298,14 @@ def build_proxy_config(
         mtga_auth_key=(global_config.get("mtga_auth_key") or ""),
         model_discovery_strategy=model_discovery_strategy,
         prompt_cache_bucket_id=prompt_cache_bucket_id,
-        prompt_cache_enabled=normalize_prompt_cache_enabled(
-            raw_config.get("prompt_cache_enabled")
-        ),
+        prompt_cache_enabled=normalize_prompt_cache_enabled(raw_config.get("prompt_cache_enabled")),
         request_params_enabled=normalize_request_params_enabled(
             raw_config.get("request_params_enabled")
+        ),
+        websocket_mode_enabled=normalize_websocket_mode_enabled(
+            raw_config.get("websocket_mode_enabled"),
+            provider=provider,
+            model_id=target_model_id,
         ),
     )
 
@@ -312,9 +335,6 @@ __all__ = [
     "normalize_prompt_cache_enabled",
     "normalize_provider",
     "normalize_request_params_enabled",
+    "normalize_websocket_mode_enabled",
     "provider_supports_model_discovery",
 ]
-
-
-
-

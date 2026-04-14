@@ -173,9 +173,7 @@ class ProxyTransport:
 
         raw_delta_obj = normalized_choice.get("delta")
         has_raw_delta = isinstance(raw_delta_obj, dict)
-        raw_delta: dict[str, Any] = (
-            cast(dict[str, Any], raw_delta_obj) if has_raw_delta else {}
-        )
+        raw_delta: dict[str, Any] = cast(dict[str, Any], raw_delta_obj) if has_raw_delta else {}
         message_obj = normalized_choice.pop("message", None)
         message: dict[str, Any] = (
             cast(dict[str, Any], message_obj) if isinstance(message_obj, dict) else {}
@@ -192,7 +190,7 @@ class ProxyTransport:
                 if content:
                     delta["content"] = content
 
-            for key in ("tool_calls", "function_calls", "reasoning_content"):
+            for key in ("tool_calls", "function_calls", "function_call", "reasoning_content"):
                 if key not in delta:
                     value = message.get(key)
                     if value not in (None, []):
@@ -519,17 +517,11 @@ class ProxyTransport:
                 continue
             choice = cast(dict[str, Any], choice_obj)
             choice_index_obj = choice.get("index")
-            choice_index = (
-                choice_index_obj if isinstance(choice_index_obj, int) else fallback_index
-            )
+            choice_index = choice_index_obj if isinstance(choice_index_obj, int) else fallback_index
             message_obj = choice.get("message")
-            message = (
-                cast(dict[str, Any], message_obj) if isinstance(message_obj, dict) else {}
-            )
+            message = cast(dict[str, Any], message_obj) if isinstance(message_obj, dict) else {}
             finish_reason_obj = choice.get("finish_reason")
-            finish_reason = (
-                finish_reason_obj if isinstance(finish_reason_obj, str) else "stop"
-            )
+            finish_reason = finish_reason_obj if isinstance(finish_reason_obj, str) else "stop"
             simulated_choices.append(
                 {
                     "index": choice_index,
@@ -631,6 +623,22 @@ class ProxyTransport:
                             {
                                 "index": choice_index,
                                 "delta": {"tool_calls": tool_calls},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+
+            function_call_obj = message.get("function_call")
+            if isinstance(function_call_obj, dict):
+                function_call = copy.deepcopy(cast(dict[str, Any], function_call_obj))
+                chunks.append(
+                    {
+                        **base_chunk,
+                        "choices": [
+                            {
+                                "index": choice_index,
+                                "delta": {"function_call": function_call},
                                 "finish_reason": None,
                             }
                         ],

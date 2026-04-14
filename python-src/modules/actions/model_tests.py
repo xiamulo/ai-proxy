@@ -221,6 +221,7 @@ def _build_generation_test_proxy_config(config_group: dict[str, Any]) -> ProxyCo
         disable_ssl_strict_mode=bool(config_group.get("disable_ssl_strict_mode", False)),
         prompt_cache_enabled=bool(config_group.get("prompt_cache_enabled", True)),
         request_params_enabled=bool(config_group.get("request_params_enabled", True)),
+        websocket_mode_enabled=bool(config_group.get("websocket_mode_enabled", False)),
         prompt_cache_bucket_id="",
         api_key=_read_config_str(config_group, "api_key"),
         mtga_auth_key="",
@@ -249,7 +250,7 @@ def _run_generation_test_with_litellm(
         test_data: dict[str, Any] = {
             "model": model_id,
             "messages": [{"role": "user", "content": GENERATION_TEST_PROMPT}],
-            "max_tokens": 1,
+            "max_tokens": 16,
             "stream": True,
         }
         if route.request_params_enabled:
@@ -374,11 +375,7 @@ def fetch_models(
 ) -> tuple[list[str], str | None]:
     payload, strategy_id = _fetch_model_payload(config_group, log_func)
     items = _extract_model_items(payload)
-    model_ids = [
-        model_id
-        for item in items
-        if (model_id := _extract_model_id(item)) is not None
-    ]
+    model_ids = [model_id for item in items if (model_id := _extract_model_id(item)) is not None]
     return model_ids, strategy_id
 
 

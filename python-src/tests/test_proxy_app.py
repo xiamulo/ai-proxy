@@ -45,6 +45,7 @@ def _build_proxy_config(
         disable_ssl_strict_mode=False,
         api_key=api_key,
         mtga_auth_key="mtga-auth",
+        websocket_mode_enabled=False,
     )
 
 
@@ -89,6 +90,8 @@ class ProxyAppGeminiTests(unittest.TestCase):
             base_url="https://gemini.example.com/v1",
             api_key="",
             prompt_cache_enabled=True,
+            request_params_enabled=True,
+            websocket_mode_enabled=False,
             middle_route_applied=True,
             middle_route_ignored=False,
         )
@@ -103,26 +106,29 @@ class ProxyAppGeminiTests(unittest.TestCase):
             return route
 
         transport = app_layer.transport
-        with patch.object(
-            transport.adapter,
-            "build_route",
-            side_effect=fake_build_route,
-        ), patch.object(
-            transport.adapter,
-            "create_chat_completion",
-            return_value={
-                "id": "chatcmpl_123",
-                "object": "chat.completion",
-                "created": 123,
-                "model": "gemini-2.5-pro",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            },
+        with (
+            patch.object(
+                transport.adapter,
+                "build_route",
+                side_effect=fake_build_route,
+            ),
+            patch.object(
+                transport.adapter,
+                "create_chat_completion",
+                return_value={
+                    "id": "chatcmpl_123",
+                    "object": "chat.completion",
+                    "created": 123,
+                    "model": "gemini-2.5-pro",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            ),
         ):
             client = app_layer.app.test_client()
             response = client.post(
@@ -210,6 +216,8 @@ class ProxyAppGeminiTests(unittest.TestCase):
             base_url="https://gemini.example.com/v1",
             api_key="upstream-key",
             prompt_cache_enabled=True,
+            request_params_enabled=True,
+            websocket_mode_enabled=False,
             middle_route_applied=True,
             middle_route_ignored=False,
         )
@@ -236,10 +244,13 @@ class ProxyAppGeminiTests(unittest.TestCase):
             return response_payload
 
         transport = app_layer.transport
-        with patch.object(transport.adapter, "build_route", return_value=route), patch.object(
-            transport.adapter,
-            "create_chat_completion",
-            side_effect=fake_create_chat_completion,
+        with (
+            patch.object(transport.adapter, "build_route", return_value=route),
+            patch.object(
+                transport.adapter,
+                "create_chat_completion",
+                side_effect=fake_create_chat_completion,
+            ),
         ):
             client = app_layer.app.test_client()
             response = client.post(
@@ -297,6 +308,8 @@ class ProxyAppGeminiTests(unittest.TestCase):
             base_url="https://gemini.example.com/v1",
             api_key="upstream-key",
             prompt_cache_enabled=True,
+            request_params_enabled=True,
+            websocket_mode_enabled=False,
             middle_route_applied=True,
             middle_route_ignored=False,
         )
@@ -337,10 +350,13 @@ class ProxyAppGeminiTests(unittest.TestCase):
             )
 
         transport = app_layer.transport
-        with patch.object(transport.adapter, "build_route", return_value=route), patch.object(
-            transport.adapter,
-            "create_chat_completion",
-            side_effect=fake_create_chat_completion,
+        with (
+            patch.object(transport.adapter, "build_route", return_value=route),
+            patch.object(
+                transport.adapter,
+                "create_chat_completion",
+                side_effect=fake_create_chat_completion,
+            ),
         ):
             client = app_layer.app.test_client()
             response = client.post(
@@ -404,6 +420,8 @@ class ProxyAppOpenAIResponseTests(unittest.TestCase):
             base_url="https://responses.example.com/v1",
             api_key="upstream-key",
             prompt_cache_enabled=True,
+            request_params_enabled=True,
+            websocket_mode_enabled=False,
             middle_route_applied=True,
             middle_route_ignored=False,
         )
@@ -437,10 +455,13 @@ class ProxyAppOpenAIResponseTests(unittest.TestCase):
         )
 
         transport = app_layer.transport
-        with patch.object(transport.adapter, "build_route", return_value=route), patch.object(
-            transport.adapter,
-            "create_chat_completion",
-            return_value=upstream_stream,
+        with (
+            patch.object(transport.adapter, "build_route", return_value=route),
+            patch.object(
+                transport.adapter,
+                "create_chat_completion",
+                return_value=upstream_stream,
+            ),
         ):
             client = app_layer.app.test_client()
             response = client.post(

@@ -51,6 +51,7 @@ def _build_proxy_config(  # noqa: PLR0913
     prompt_cache_bucket_id: str = "",
     prompt_cache_enabled: bool = True,
     request_params_enabled: bool = True,
+    websocket_mode_enabled: bool = False,
 ) -> ProxyConfig:
     return ProxyConfig(
         provider=provider,
@@ -67,6 +68,7 @@ def _build_proxy_config(  # noqa: PLR0913
         prompt_cache_bucket_id=prompt_cache_bucket_id,
         prompt_cache_enabled=prompt_cache_enabled,
         request_params_enabled=request_params_enabled,
+        websocket_mode_enabled=websocket_mode_enabled,
     )
 
 
@@ -153,13 +155,16 @@ class UpstreamAdapterTests(unittest.TestCase):
             )
         )
 
-        with patch(
-            "modules.proxy.upstream_adapter.litellm.get_supported_openai_params",
-            return_value=["reasoning_effort", "stream"],
-        ), patch(
-            "modules.proxy.upstream_adapter.litellm.completion",
-            return_value={"id": "chatcmpl_123", "choices": []},
-        ) as completion_mock:
+        with (
+            patch(
+                "modules.proxy.upstream_adapter._get_supported_openai_params",
+                return_value=["reasoning_effort", "stream"],
+            ),
+            patch(
+                "modules.proxy.upstream_adapter._create_litellm_completion",
+                return_value={"id": "chatcmpl_123", "choices": []},
+            ) as completion_mock,
+        ):
             adapter.create_chat_completion(
                 route=route,
                 request_data={
@@ -193,7 +198,7 @@ class UpstreamAdapterTests(unittest.TestCase):
         )
 
         with patch(
-            "modules.proxy.upstream_adapter.litellm.completion",
+            "modules.proxy.upstream_adapter._create_litellm_completion",
             return_value={"id": "chatcmpl_123", "choices": []},
         ) as completion_mock:
             adapter.create_chat_completion(
@@ -233,7 +238,7 @@ class UpstreamAdapterTests(unittest.TestCase):
         )
 
         with patch(
-            "modules.proxy.upstream_adapter.litellm.completion",
+            "modules.proxy.upstream_adapter._create_litellm_completion",
             return_value={"id": "chatcmpl_123", "choices": []},
         ) as completion_mock:
             adapter.create_chat_completion(
@@ -242,9 +247,250 @@ class UpstreamAdapterTests(unittest.TestCase):
             )
 
         call_kwargs = completion_mock.call_args.kwargs
-        self.assertEqual(call_kwargs["base_url"], "https://anthropic-proxy.example.com")
+        self.assertEqual(call_kwargs["base_url"], "https://anthropic-proxy.example.com/v1")
         self.assertNotIn("api_base", call_kwargs)
         self.assertNotIn("custom_llm_provider", call_kwargs)
+
+    def test_openai_response_gpt_5_4_stream_uses_websocket_mode(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+
+        with (
+            patch.object(
+                adapter,
+                "_create_openai_responses_websocket_stream",
+                return_value=iter([]),
+            ) as websocket_mock,
+            patch(
+                "modules.proxy.upstream_adapter._create_litellm_completion",
+            ) as completion_mock,
+        ):
+            stream = adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "stream": True,
+                },
+            )
+            chunks = list(stream)
+
+        self.assertEqual(chunks, [])
+        websocket_mock.assert_called_once()
+        completion_mock.assert_not_called()
+        self.assertTrue(
+            any("流式请求优先使用 OpenAI Responses WebSocket 模式" in item for item in logs)
+        )
+
+    def test_openai_response_gpt_5_4_stream_falls_back_to_http_when_websocket_connection_fails(
+        self,
+    ) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+
+        def broken_websocket_stream() -> Any:
+            raise RuntimeError("dial tcp timeout")
+            yield  # pragma: no cover
+
+        with (
+            patch.object(
+                adapter,
+                "_create_openai_responses_websocket_stream",
+                return_value=broken_websocket_stream(),
+            ),
+            patch(
+                "modules.proxy.upstream_adapter._create_litellm_completion",
+                return_value=iter([{"id": "chatcmpl_123", "choices": []}]),
+            ) as completion_mock,
+        ):
+            stream = adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "stream": True,
+                },
+            )
+            chunks = list(stream)
+
+        self.assertEqual(len(chunks), 1)
+        completion_mock.assert_called_once()
+        self.assertTrue(
+            any("WebSocket 模式出问题了，没连接上，已回退到普通 HTTP" in item for item in logs)
+        )
+
+    def test_websocket_request_converts_tool_history_and_legacy_function_fields(self) -> None:
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        payload, error = LiteLLMUpstreamAdapter._build_openai_responses_websocket_request(
+            route=route,
+            request_data={
+                "messages": [
+                    {"role": "system", "content": "系统提示"},
+                    {"role": "user", "content": "先查天气"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_weather",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": '{"city":"上海"}'},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_weather",
+                        "content": "晴天",
+                    },
+                    {
+                        "role": "assistant",
+                        "function_call": {"name": "summarize", "arguments": {"result": "晴天"}},
+                        "content": "我来整理",
+                    },
+                    {
+                        "role": "function",
+                        "name": "summarize",
+                        "content": "总结完成",
+                    },
+                ],
+                "functions": [
+                    {
+                        "name": "summarize",
+                        "description": "总结天气结果",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"result": {"type": "string"}},
+                        },
+                    }
+                ],
+                "function_call": {"name": "summarize"},
+            },
+        )
+
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertEqual(payload["instructions"], "系统提示")
+        self.assertEqual(payload["tool_choice"], {"type": "function", "name": "summarize"})
+        self.assertEqual(payload["tools"][0]["type"], "function")
+        input_items = payload["input"]
+        self.assertEqual(input_items[0]["role"], "user")
+        self.assertEqual(input_items[1]["type"], "function_call")
+        self.assertEqual(input_items[1]["call_id"], "call_weather")
+        self.assertEqual(input_items[2]["type"], "function_call_output")
+        self.assertEqual(input_items[2]["call_id"], "call_weather")
+        self.assertEqual(input_items[3]["type"], "message")
+        self.assertEqual(input_items[3]["role"], "assistant")
+        self.assertEqual(input_items[4]["type"], "function_call")
+        self.assertEqual(input_items[4]["name"], "summarize")
+        self.assertEqual(input_items[5]["type"], "function_call_output")
+        self.assertEqual(input_items[5]["output"], "总结完成")
+
+    def test_websocket_stream_emits_tool_calls_for_responses_events(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        captured_payload: dict[str, Any] = {}
+        events = [
+            {"type": "response.created", "response": {"id": "resp_123", "created_at": 123}},
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup_weather",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "arguments": '{"city":"上海"}',
+            },
+            {"type": "response.completed"},
+        ]
+
+        class FakeResponseResource:
+            def create(self, **kwargs: Any) -> None:
+                captured_payload.update(kwargs)
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.response = FakeResponseResource()
+
+            def __enter__(self) -> FakeConnection:
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+            def __iter__(self) -> Any:
+                return iter(events)
+
+        class FakeResponses:
+            def connect(self) -> FakeConnection:
+                return FakeConnection()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = FakeResponses()
+
+        with patch("modules.proxy.upstream_adapter.OpenAI", return_value=FakeClient()):
+            stream = adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "查天气"}],
+                    "stream": True,
+                },
+            )
+            chunks = list(stream)
+
+        self.assertEqual(captured_payload["model"], "gpt-5.4")
+        self.assertEqual(
+            chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "lookup_weather"
+        )
+        self.assertEqual(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            '{"city":"上海"}',
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ dependencies = [
     "PyYAML",
     "xxhash>=3.5.0",
     "litellm>=1.82.6,<2",
+    "websockets>=15,<16",
 ]
 
 [tool.uv]
