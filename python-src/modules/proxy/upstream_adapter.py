@@ -4,6 +4,7 @@ import contextlib
 import copy
 import json
 import os
+import re
 import ssl
 import threading
 import time
@@ -36,6 +37,30 @@ LITELLM_CONNECT_RETRY_COUNT = 2
 UPSTREAM_PARAM_SELF_HEAL_MAX_ATTEMPTS = 3
 WEBSOCKET_SESSION_IDLE_TIMEOUT_SECONDS = 15 * 60
 WEBSOCKET_SESSION_MAX_COUNT = 64
+OPENAI_STRICT_SCHEMA_SELF_HEAL_MAX_ATTEMPTS = 4
+OPENAI_UNSUPPORTED_PARAM_SELF_HEAL_MAX_ATTEMPTS = 4
+OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS: frozenset[str] = frozenset(
+    {
+        "allOf",
+        "oneOf",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "prefixItems",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "minProperties",
+        "maxProperties",
+    }
+)
 OPENAI_CHAT_COMPLETION_STANDARD_PARAMS: frozenset[str] = frozenset(
     {
         "model",
@@ -129,6 +154,7 @@ class ResponsesWebSocketSessionState:
     connection_started_at: float = 0.0
     last_used_at: float = 0.0
     last_response_id: str | None = None
+    last_response_connection_started_at: float = 0.0
     conversation_messages: list[dict[str, Any]] = field(
         default_factory=lambda: cast(list[dict[str, Any]], [])
     )
@@ -519,6 +545,21 @@ class LiteLLMUpstreamAdapter:
         return current_messages[:previous_count] == previous_messages
 
     @staticmethod
+    def _requires_full_history_websocket_turn(delta_messages: list[dict[str, Any]]) -> bool:
+        for message in delta_messages:
+            role_obj = message.get("role")
+            role = role_obj if isinstance(role_obj, str) else ""
+            if role in {"tool", "function"}:
+                return True
+            if role != "assistant":
+                continue
+            if isinstance(message.get("tool_calls"), list) or isinstance(
+                message.get("function_call"), dict
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _extract_websocket_session_key(request_data: dict[str, Any]) -> tuple[str | None, bool]:
         metadata_obj = request_data.get("metadata")
         if isinstance(metadata_obj, dict):
@@ -535,6 +576,27 @@ class LiteLLMUpstreamAdapter:
                 if isinstance(value_obj, str) and value_obj.strip():
                     return value_obj.strip(), True
         return None, False
+
+    @staticmethod
+    def _sanitize_websocket_metadata_for_upstream(
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if metadata is None:
+            return None
+        sanitized = {
+            key: value
+            for key, value in metadata.items()
+            if key
+            not in {
+                "mtga_ws_session_id",
+                "mtga_session_id",
+                "session_id",
+                "conversation_id",
+                "chat_id",
+                "thread_id",
+            }
+        }
+        return sanitized or None
 
     def _collect_stale_websocket_sessions_locked(
         self, *, now: float
@@ -594,6 +656,7 @@ class LiteLLMUpstreamAdapter:
 
     def _reset_websocket_session_chain(self, session: ResponsesWebSocketSessionState) -> None:
         session.last_response_id = None
+        session.last_response_connection_started_at = 0.0
         session.conversation_messages = []
 
     def _open_websocket_session_connection(
@@ -723,15 +786,37 @@ class LiteLLMUpstreamAdapter:
 
     @classmethod
     def _normalize_strict_schema_node(cls, node: Any) -> Any:
+        return cls._normalize_strict_schema_node_with_keys(
+            node=node,
+            unsupported_schema_keys=OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS,
+        )
+
+    @classmethod
+    def _normalize_strict_schema_node_with_keys(
+        cls,
+        *,
+        node: Any,
+        unsupported_schema_keys: frozenset[str],
+    ) -> Any:
         if isinstance(node, list):
-            return [cls._normalize_strict_schema_node(item) for item in cast(list[Any], node)]
+            return [
+                cls._normalize_strict_schema_node_with_keys(
+                    node=item,
+                    unsupported_schema_keys=unsupported_schema_keys,
+                )
+                for item in cast(list[Any], node)
+            ]
         if not isinstance(node, dict):
             return node
 
-        normalized = {
-            key: cls._normalize_strict_schema_node(value)
-            for key, value in cast(dict[str, Any], node).items()
-        }
+        normalized: dict[str, Any] = {}
+        for key, value in cast(dict[str, Any], node).items():
+            if key in unsupported_schema_keys:
+                continue
+            normalized[key] = cls._normalize_strict_schema_node_with_keys(
+                node=value,
+                unsupported_schema_keys=unsupported_schema_keys,
+            )
         type_obj = normalized.get("type")
         is_object_type = type_obj == "object" or (
             isinstance(type_obj, list) and "object" in type_obj
@@ -747,7 +832,10 @@ class LiteLLMUpstreamAdapter:
 
     @classmethod
     def _normalize_strict_function_parameters(
-        cls, parameters: dict[str, Any] | None
+        cls,
+        parameters: dict[str, Any] | None,
+        *,
+        extra_unsupported_schema_keys: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         if parameters is None:
             return {
@@ -756,10 +844,24 @@ class LiteLLMUpstreamAdapter:
                 "required": [],
                 "additionalProperties": False,
             }
-        return cast(dict[str, Any], cls._normalize_strict_schema_node(parameters))
+        unsupported_schema_keys = frozenset(
+            {*OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS, *extra_unsupported_schema_keys}
+        )
+        return cast(
+            dict[str, Any],
+            cls._normalize_strict_schema_node_with_keys(
+                node=parameters,
+                unsupported_schema_keys=unsupported_schema_keys,
+            ),
+        )
 
     @classmethod
-    def _convert_function_tool_definition(cls, definition: dict[str, Any]) -> dict[str, Any] | None:
+    def _convert_function_tool_definition(
+        cls,
+        definition: dict[str, Any],
+        *,
+        extra_unsupported_schema_keys: frozenset[str] = frozenset(),
+    ) -> dict[str, Any] | None:
         name_obj = definition.get("name")
         if not isinstance(name_obj, str) or not name_obj.strip():
             return None
@@ -771,7 +873,8 @@ class LiteLLMUpstreamAdapter:
         strict = strict_obj if isinstance(strict_obj, bool) else True
         if strict:
             parameters = cls._normalize_strict_function_parameters(
-                cast(dict[str, Any] | None, parameters)
+                cast(dict[str, Any] | None, parameters),
+                extra_unsupported_schema_keys=extra_unsupported_schema_keys,
             )
         tool: dict[str, Any] = {
             "type": "function",
@@ -786,7 +889,10 @@ class LiteLLMUpstreamAdapter:
 
     @classmethod
     def _convert_chat_tools_to_responses_tools(
-        cls, request_data: dict[str, Any]
+        cls,
+        request_data: dict[str, Any],
+        *,
+        extra_unsupported_schema_keys: frozenset[str] = frozenset(),
     ) -> list[dict[str, Any]] | None:
         converted_tools: list[dict[str, Any]] = []
         tools_obj = request_data.get("tools")
@@ -804,7 +910,8 @@ class LiteLLMUpstreamAdapter:
                 if not isinstance(function_obj, dict):
                     return None
                 converted_tool = cls._convert_function_tool_definition(
-                    cast(dict[str, Any], function_obj)
+                    cast(dict[str, Any], function_obj),
+                    extra_unsupported_schema_keys=extra_unsupported_schema_keys,
                 )
                 if converted_tool is None:
                     return None
@@ -816,7 +923,8 @@ class LiteLLMUpstreamAdapter:
                 if not isinstance(function_obj, dict):
                     return None
                 converted_tool = cls._convert_function_tool_definition(
-                    cast(dict[str, Any], function_obj)
+                    cast(dict[str, Any], function_obj),
+                    extra_unsupported_schema_keys=extra_unsupported_schema_keys,
                 )
                 if converted_tool is None:
                     return None
@@ -889,13 +997,20 @@ class LiteLLMUpstreamAdapter:
                 input_items.append(
                     {
                         "type": "function_call",
-                        "id": call_id,
                         "call_id": call_id,
                         "name": name_obj,
                         "arguments": arguments,
                         "status": "completed",
                     }
                 )
+                function_call_item = input_items[-1]
+                tool_item_id_obj = tool_call.get("id")
+                if (
+                    isinstance(tool_item_id_obj, str)
+                    and tool_item_id_obj.strip()
+                    and tool_item_id_obj.startswith("fc_")
+                ):
+                    function_call_item["id"] = tool_item_id_obj
             return legacy_call_counter, None
 
         function_call_obj = message.get("function_call")
@@ -1049,7 +1164,12 @@ class LiteLLMUpstreamAdapter:
 
     @classmethod
     def _build_openai_responses_websocket_request(
-        cls, *, route: UpstreamRoute, request_data: dict[str, Any]
+        cls,
+        *,
+        route: UpstreamRoute,
+        request_data: dict[str, Any],
+        extra_unsupported_schema_keys: frozenset[str] = frozenset(),
+        stripped_top_level_keys: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any] | None, str | None]:
         messages_obj = request_data.get("messages")
         if not isinstance(messages_obj, list):
@@ -1067,7 +1187,10 @@ class LiteLLMUpstreamAdapter:
         if instructions:
             payload["instructions"] = instructions
 
-        converted_tools = cls._convert_chat_tools_to_responses_tools(request_data)
+        converted_tools = cls._convert_chat_tools_to_responses_tools(
+            request_data,
+            extra_unsupported_schema_keys=extra_unsupported_schema_keys,
+        )
         if request_data.get("tools") is not None or request_data.get("functions") is not None:
             if converted_tools is None:
                 return None, "顶层 tools/functions 无法转换为 Responses tools"
@@ -1078,7 +1201,6 @@ class LiteLLMUpstreamAdapter:
             payload["tool_choice"] = converted_tool_choice
 
         passthrough_keys = (
-            "metadata",
             "parallel_tool_calls",
             "service_tier",
             "store",
@@ -1090,12 +1212,23 @@ class LiteLLMUpstreamAdapter:
             if key in request_data:
                 payload[key] = request_data[key]
 
+        metadata_obj = request_data.get("metadata")
+        metadata = (
+            cast(dict[str, Any], metadata_obj) if isinstance(metadata_obj, dict) else None
+        )
+        sanitized_metadata = cls._sanitize_websocket_metadata_for_upstream(metadata)
+        if sanitized_metadata is not None:
+            payload["metadata"] = sanitized_metadata
+
         if "reasoning_effort" in request_data:
             payload["reasoning"] = {"effort": request_data["reasoning_effort"]}
 
         max_tokens = request_data.get("max_completion_tokens", request_data.get("max_tokens"))
         if max_tokens is not None:
             payload["max_output_tokens"] = max_tokens
+
+        for key in stripped_top_level_keys:
+            payload.pop(key, None)
 
         return payload, None
 
@@ -1121,26 +1254,35 @@ class LiteLLMUpstreamAdapter:
             ],
         }
 
-    def _build_openai_responses_websocket_turn_payload(
+    def _build_openai_responses_websocket_turn_payload(  # noqa: PLR0913
         self,
         *,
         route: UpstreamRoute,
         request_data: dict[str, Any],
         session: ResponsesWebSocketSessionState,
         current_messages: list[dict[str, Any]],
+        extra_unsupported_schema_keys: frozenset[str] = frozenset(),
+        stripped_top_level_keys: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any] | None, bool, str | None]:
         continue_with_previous = False
         turn_request_data = copy.deepcopy(request_data)
         previous_messages = session.conversation_messages
         if (
             session.last_response_id
+            and session.last_response_connection_started_at > 0
+            and session.last_response_connection_started_at == session.connection_started_at
             and previous_messages
             and self._messages_extend_prefix(previous_messages, current_messages)
         ):
             delta_messages = current_messages[len(previous_messages) :]
-            if delta_messages:
+            if delta_messages and not self._requires_full_history_websocket_turn(delta_messages):
                 turn_request_data["messages"] = delta_messages
                 continue_with_previous = True
+            elif delta_messages:
+                self._log(
+                    "OpenAI Responses WebSocket 工具续链回退为全量历史: "
+                    f"session={session.session_id}"
+                )
             else:
                 self._log(
                     "OpenAI Responses WebSocket 检测到重复历史，改为新链路: "
@@ -1150,6 +1292,8 @@ class LiteLLMUpstreamAdapter:
         payload, error = self._build_openai_responses_websocket_request(
             route=route,
             request_data=turn_request_data,
+            extra_unsupported_schema_keys=extra_unsupported_schema_keys,
+            stripped_top_level_keys=stripped_top_level_keys,
         )
         if payload is None:
             return None, False, error
@@ -1168,6 +1312,37 @@ class LiteLLMUpstreamAdapter:
             )
         return payload, continue_with_previous, None
 
+    @staticmethod
+    def _extract_unsupported_schema_keyword(error: Exception) -> str | None:
+        message = str(error)
+        for pattern in (
+            r"'([^']+)' is not permitted",
+            r'"([^"]+)" is not permitted',
+        ):
+            match = re.search(pattern, message)
+            if match is None:
+                continue
+            keyword = match.group(1).strip()
+            if keyword:
+                return keyword
+        return None
+
+    @staticmethod
+    def _extract_unsupported_top_level_param(error: Exception) -> str | None:
+        message = str(error)
+        for pattern in (
+            r"Unsupported parameter:\s*'([^']+)'",
+            r'Unsupported parameter:\s*"([^"]+)"',
+            r"Unsupported parameter:\s*([A-Za-z0-9_\.]+)",
+        ):
+            match = re.search(pattern, message)
+            if match is None:
+                continue
+            param = match.group(1).strip()
+            if param:
+                return param.split(".", 1)[0]
+        return None
+
     def _stream_openai_responses_websocket_turn(  # noqa: PLR0912, PLR0915
         self,
         *,
@@ -1175,6 +1350,7 @@ class LiteLLMUpstreamAdapter:
         session: ResponsesWebSocketSessionState,
         payload: dict[str, Any],
         current_messages: list[dict[str, Any]],
+        create_request: bool = True,
     ) -> Any:
         connection = session.connection
         if connection is None:
@@ -1190,7 +1366,8 @@ class LiteLLMUpstreamAdapter:
         def now_ts() -> int:
             return int(time.time())
 
-        connection.response.create(**payload)
+        if create_request:
+            connection.response.create(**payload)
         for event in connection:
             event_payload = _coerce_model_dump(event)
             if event_payload is None:
@@ -1266,7 +1443,7 @@ class LiteLLMUpstreamAdapter:
                     response_id=response_id,
                     created=created or now_ts(),
                     model=route.litellm_model,
-                    delta={"tool_calls": [assistant_tool_calls[-1]]},
+                    delta={"tool_calls": [copy.deepcopy(assistant_tool_calls[-1])]},
                 )
                 continue
 
@@ -1325,6 +1502,7 @@ class LiteLLMUpstreamAdapter:
                 if assistant_message is not None:
                     updated_messages.append(assistant_message)
                 session.last_response_id = response_id
+                session.last_response_connection_started_at = session.connection_started_at
                 session.conversation_messages = updated_messages
                 session.last_used_at = time.time()
                 yield self._build_openai_chat_delta_chunk(
@@ -1343,12 +1521,14 @@ class LiteLLMUpstreamAdapter:
                 error_payload = (
                     cast(dict[str, Any], error_obj) if isinstance(error_obj, dict) else {}
                 )
-                message_obj = error_payload.get("message")
-                message = (
-                    message_obj.strip()
-                    if isinstance(message_obj, str) and message_obj.strip()
-                    else f"OpenAI Responses WebSocket 返回错误事件: {event_type}"
-                )
+                message = ""
+                for key in ("message", "detail"):
+                    message_obj = error_payload.get(key)
+                    if isinstance(message_obj, str) and message_obj.strip():
+                        message = message_obj.strip()
+                        break
+                if not message:
+                    message = f"OpenAI Responses WebSocket 返回错误事件: {event_type}"
                 code_obj = error_payload.get("code")
                 code = code_obj.strip() if isinstance(code_obj, str) and code_obj.strip() else None
                 raise ResponsesWebSocketSessionError(message, code=code, status=status)
@@ -1369,8 +1549,13 @@ class LiteLLMUpstreamAdapter:
         )
 
         def generate() -> Any:  # noqa: PLR0912, PLR0915
+            dynamic_unsupported_schema_keys: set[str] = set()
+            dynamic_stripped_top_level_keys: set[str] = set()
+            schema_self_heal_attempts = 0
+            unsupported_param_self_heal_attempts = 0
+            recoverable_session_attempts = 0
             with session.lock:
-                for attempt in range(2):
+                while True:
                     emitted_output = False
                     self._ensure_websocket_session_connection(session=session, route=route)
                     payload, _continued, error = (
@@ -1379,6 +1564,12 @@ class LiteLLMUpstreamAdapter:
                             request_data=request_data,
                             session=session,
                             current_messages=current_messages,
+                            extra_unsupported_schema_keys=frozenset(
+                                dynamic_unsupported_schema_keys
+                            ),
+                            stripped_top_level_keys=frozenset(
+                                dynamic_stripped_top_level_keys
+                            ),
                         )
                     )
                     if payload is None:
@@ -1396,12 +1587,41 @@ class LiteLLMUpstreamAdapter:
                         return
                     except ResponsesWebSocketSessionError as exc:
                         session.last_used_at = time.time()
+                        unsupported_top_level_param = self._extract_unsupported_top_level_param(exc)
+                        can_self_heal_param = (
+                            not emitted_output
+                            and unsupported_top_level_param is not None
+                            and unsupported_top_level_param not in dynamic_stripped_top_level_keys
+                            and unsupported_param_self_heal_attempts
+                            < OPENAI_UNSUPPORTED_PARAM_SELF_HEAL_MAX_ATTEMPTS
+                        )
+                        if can_self_heal_param:
+                            assert unsupported_top_level_param is not None
+                            dynamic_stripped_top_level_keys.add(unsupported_top_level_param)
+                            unsupported_param_self_heal_attempts += 1
+                            self._log(
+                                "OpenAI Responses WebSocket 参数自愈: "
+                                f"session={session.session_id} "
+                                f"drop_param={unsupported_top_level_param}"
+                            )
+                            self._close_websocket_session(session)
+                            self._open_websocket_session_connection(
+                                session=session,
+                                route=route,
+                                reconnect_reason=f"unsupported_param:{unsupported_top_level_param}",
+                            )
+                            continue
                         recoverable_codes = {
                             "previous_response_not_found",
                             "websocket_connection_limit_reached",
                         }
-                        if emitted_output or exc.code not in recoverable_codes or attempt >= 1:
+                        if (
+                            emitted_output
+                            or exc.code not in recoverable_codes
+                            or recoverable_session_attempts >= 1
+                        ):
                             raise
+                        recoverable_session_attempts += 1
                         self._log(
                             "OpenAI Responses WebSocket 会话恢复: "
                             f"session={session.session_id} code={exc.code}"
@@ -1413,7 +1633,34 @@ class LiteLLMUpstreamAdapter:
                             reconnect_reason=exc.code,
                         )
                         continue
-                    except Exception:
+                    except Exception as exc:
+                        session.last_used_at = time.time()
+                        unsupported_schema_key = self._extract_unsupported_schema_keyword(exc)
+                        can_self_heal_schema = (
+                            not emitted_output
+                            and unsupported_schema_key is not None
+                            and unsupported_schema_key
+                            not in OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS
+                            and unsupported_schema_key not in dynamic_unsupported_schema_keys
+                            and schema_self_heal_attempts
+                            < OPENAI_STRICT_SCHEMA_SELF_HEAL_MAX_ATTEMPTS
+                        )
+                        if can_self_heal_schema:
+                            assert unsupported_schema_key is not None
+                            dynamic_unsupported_schema_keys.add(unsupported_schema_key)
+                            schema_self_heal_attempts += 1
+                            self._log(
+                                "OpenAI Responses WebSocket strict schema 自愈: "
+                                f"session={session.session_id} "
+                                f"strip_key={unsupported_schema_key}"
+                            )
+                            self._close_websocket_session(session)
+                            self._open_websocket_session_connection(
+                                session=session,
+                                route=route,
+                                reconnect_reason=f"strict_schema:{unsupported_schema_key}",
+                            )
+                            continue
                         self._close_websocket_session(session)
                         self._reset_websocket_session_chain(session)
                         raise
@@ -1439,6 +1686,11 @@ class LiteLLMUpstreamAdapter:
         route: UpstreamRoute,
         request_data: dict[str, Any],
     ) -> Any:
+        if route.provider == OPENAI_RESPONSE_PROVIDER:
+            return self._create_openai_responses_http_stream(
+                route=route,
+                request_data=request_data,
+            )
         call_kwargs = self._normalize_provider_chat_request(
             route=route,
             request_data=request_data,
@@ -1448,6 +1700,61 @@ class LiteLLMUpstreamAdapter:
         call_kwargs["api_key"] = route.api_key
         call_kwargs["ssl_verify"] = self._build_request_ssl_verify(self._disable_ssl_strict_mode)
         return _create_litellm_completion(**call_kwargs)
+
+    def _create_openai_responses_http_stream(
+        self,
+        *,
+        route: UpstreamRoute,
+        request_data: dict[str, Any],
+    ) -> Any:
+        messages_obj = request_data.get("messages")
+        if not isinstance(messages_obj, list):
+            raise ValueError("缺少可转换的 messages 数组")
+        current_messages = self._clone_message_list(cast(list[Any], messages_obj))
+        payload, error = self._build_openai_responses_websocket_request(
+            route=route,
+            request_data=request_data,
+        )
+        if payload is None:
+            raise ValueError(error or "无法构造 Responses HTTP 请求")
+
+        client = OpenAI(api_key=route.api_key, base_url=route.base_url)
+        raw_stream = client.responses.create(stream=True, **payload)
+
+        class _NoOpResponseResource:
+            def create(self, **kwargs: Any) -> None:
+                return None
+
+        class _HTTPConnection:
+            def __init__(self, stream: Any) -> None:
+                self.response = _NoOpResponseResource()
+                self._stream = stream
+
+            def __iter__(self) -> Any:
+                return iter(self._stream)
+
+        temp_session = ResponsesWebSocketSessionState(
+            session_id="http_fallback",
+            explicit_session_key=True,
+        )
+        temp_session.connection = _HTTPConnection(raw_stream)
+
+        def generate() -> Any:
+            try:
+                yield from self._stream_openai_responses_websocket_turn(
+                    route=route,
+                    session=temp_session,
+                    payload=payload,
+                    current_messages=current_messages,
+                    create_request=False,
+                )
+            finally:
+                close = getattr(raw_stream, "close", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        close()
+
+        return generate()
 
     def _create_chat_completion_with_websocket_fallback(
         self,
