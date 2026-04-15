@@ -319,7 +319,36 @@ jobs:
         working-directory: .
 
       - name: 🧱 打包 Tauri
-        run: pnpm tauri:bundle:mac:ci
+        run: |
+          set -euo pipefail
+
+          cleanup_dmg_state() {
+            rm -f src-tauri/target/bundle-release/bundle/dmg/*.dmg
+            if [ -d "/Volumes/ai-proxy" ]; then
+              hdiutil detach "/Volumes/ai-proxy" -force || true
+            fi
+            hdiutil info | awk '/\/Volumes\/ai-proxy$/ { print $1 }' | while read -r dev; do
+              [ -n "$dev" ] || continue
+              hdiutil detach "$dev" -force || true
+            done
+          }
+
+          cleanup_dmg_state
+
+          for i in 1 2 3; do
+            echo "🔁 执行 macOS Tauri 打包（第 $i 次）..."
+            if pnpm tauri:bundle:mac:ci; then
+              exit 0
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "⚠️ DMG 打包失败，准备清理挂载状态后重试..."
+              cleanup_dmg_state
+              sleep $((i * 10))
+            fi
+          done
+
+          echo "❌ macOS Tauri 打包失败（重试 3 次后仍失败）"
+          exit 1
         working-directory: .
 
       - name: 🏷️ 重命名 macOS 安装包
