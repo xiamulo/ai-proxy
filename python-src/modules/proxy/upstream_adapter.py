@@ -282,7 +282,9 @@ class LiteLLMUpstreamAdapter:
         self._param_self_heal = UpstreamParamSelfHealController()
         self._websocket_sessions: dict[str, ResponsesWebSocketSessionState] = {}
         self._websocket_sessions_lock = threading.RLock()
-        self._websocket_session_history_index: dict[str, set[str]] = {}
+        self._websocket_session_history_index: dict[
+            str, dict[str, list[dict[str, Any]]]
+        ] = {}
         self._websocket_session_history_hashes: dict[str, set[str]] = {}
 
     def build_route(
@@ -693,17 +695,19 @@ class LiteLLMUpstreamAdapter:
             if history_hash in session_hashes:
                 return
             session_hashes.add(history_hash)
-            self._websocket_session_history_index.setdefault(history_hash, set()).add(session_id)
+            self._websocket_session_history_index.setdefault(history_hash, {})[
+                session_id
+            ] = self._clone_message_list(messages)
 
     def _unregister_websocket_session_history(self, *, session_id: str) -> None:
         with self._websocket_sessions_lock:
             history_hashes = self._websocket_session_history_hashes.pop(session_id, set())
             for history_hash in history_hashes:
-                session_ids = self._websocket_session_history_index.get(history_hash)
-                if session_ids is None:
+                session_snapshots = self._websocket_session_history_index.get(history_hash)
+                if session_snapshots is None:
                     continue
-                session_ids.discard(session_id)
-                if not session_ids:
+                session_snapshots.pop(session_id, None)
+                if not session_snapshots:
                     self._websocket_session_history_index.pop(history_hash, None)
 
     def _prune_websocket_sessions(self) -> None:
@@ -804,20 +808,30 @@ class LiteLLMUpstreamAdapter:
         self,
         *,
         current_messages: list[dict[str, Any]],
-    ) -> tuple[ResponsesWebSocketSessionState | None, int, int, str | None]:
+    ) -> tuple[
+        ResponsesWebSocketSessionState | None,
+        int,
+        int,
+        str | None,
+        list[dict[str, Any]] | None,
+    ]:
         with self._websocket_sessions_lock:
             for prefix_len in range(len(current_messages), 0, -1):
                 history_hash = self._build_messages_history_hash(current_messages[:prefix_len])
-                candidate_ids = self._websocket_session_history_index.get(history_hash, set())
-                active_candidates = [
-                    self._websocket_sessions[session_id]
-                    for session_id in candidate_ids
-                    if session_id in self._websocket_sessions
-                ]
+                candidate_snapshots = self._websocket_session_history_index.get(history_hash, {})
+                active_candidates: list[
+                    tuple[ResponsesWebSocketSessionState, list[dict[str, Any]]]
+                ] = []
+                for session_id, snapshot in candidate_snapshots.items():
+                    session = self._websocket_sessions.get(session_id)
+                    if session is None:
+                        continue
+                    active_candidates.append((session, self._clone_message_list(snapshot)))
                 if len(active_candidates) == 1:
-                    return active_candidates[0], prefix_len, 1, "history_index"
+                    session, snapshot = active_candidates[0]
+                    return session, prefix_len, 1, "history_index", snapshot
                 if len(active_candidates) > 1:
-                    return None, prefix_len, len(active_candidates), "history_index"
+                    return None, prefix_len, len(active_candidates), "history_index", None
 
         best_session: ResponsesWebSocketSessionState | None = None
         best_prefix_len = -1
@@ -836,8 +850,8 @@ class LiteLLMUpstreamAdapter:
             if prefix_len == best_prefix_len:
                 best_match_count += 1
         if best_match_count == 1:
-            return best_session, best_prefix_len, best_match_count, "conversation_state"
-        return None, best_prefix_len, best_match_count, "conversation_state"
+            return best_session, best_prefix_len, best_match_count, "conversation_state", None
+        return None, best_prefix_len, best_match_count, "conversation_state", None
 
     def _get_or_create_websocket_session(
         self,
@@ -852,6 +866,7 @@ class LiteLLMUpstreamAdapter:
         matched_prefix_len = 0
         matched_candidates = 0
         matched_source = "none"
+        matched_messages: list[dict[str, Any]] | None = None
         with self._websocket_sessions_lock:
             if explicit_key is not None:
                 session = self._websocket_sessions.get(explicit_key)
@@ -867,13 +882,21 @@ class LiteLLMUpstreamAdapter:
                     selection_reason = "explicit_reuse"
                 selected_session = session
             else:
-                matched_session, matched_prefix_len, matched_candidates, matched_source = (
+                (
+                    matched_session,
+                    matched_prefix_len,
+                    matched_candidates,
+                    matched_source,
+                    matched_messages,
+                ) = (
                     self._find_matching_websocket_session(
                         current_messages=current_messages
                     )
                 )
                 if matched_session is not None:
                     selected_session = matched_session
+                    if matched_messages is not None:
+                        selected_session.conversation_messages = matched_messages
                     selection_reason = (
                         "matched_history_prefix"
                         if matched_source == "history_index"
