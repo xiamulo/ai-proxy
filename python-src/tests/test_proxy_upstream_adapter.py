@@ -1166,9 +1166,9 @@ class UpstreamAdapterTests(unittest.TestCase):
         explicit_session = adapter._get_or_create_websocket_session(
             request_data={
                 "metadata": {"session_id": "session-explicit"},
-                "messages": [{"role": "user", "content": "hello"}],
+                "messages": [{"role": "user", "content": "explicit"}],
             },
-            current_messages=[{"role": "user", "content": "hello"}],
+            current_messages=[{"role": "user", "content": "explicit"}],
         )
         self.assertEqual(explicit_session.session_id, "session-explicit")
 
@@ -1200,6 +1200,45 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertEqual(reused_session.session_id, "session-matched")
         self.assertTrue(any("reason=explicit_new" in item for item in logs))
         self.assertTrue(any("reason=matched_prefix" in item for item in logs))
+
+    def test_websocket_session_history_index_reuses_anonymous_session(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+
+        first_session = adapter._get_or_create_websocket_session(
+            request_data={
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ]
+            },
+            current_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        )
+        self.assertFalse(first_session.explicit_session_key)
+
+        second_session = adapter._get_or_create_websocket_session(
+            request_data={
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                    {"role": "user", "content": "continue"},
+                ]
+            },
+            current_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        self.assertEqual(second_session.session_id, first_session.session_id)
+        self.assertTrue(any("reason=matched_history_prefix" in item for item in logs))
 
     def test_websocket_request_normalizes_strict_function_schema_recursively(self) -> None:
         route = build_upstream_route(
@@ -1330,6 +1369,11 @@ class UpstreamAdapterTests(unittest.TestCase):
                                             "allOf": [{"type": "object"}],
                                         },
                                     }
+                                    ,
+                                    "url": {
+                                        "type": "string",
+                                        "format": "uri",
+                                    }
                                 },
                             },
                         },
@@ -1345,6 +1389,10 @@ class UpstreamAdapterTests(unittest.TestCase):
         items = log_levels["items"]
         self.assertNotIn("allOf", items)
         self.assertEqual(items["additionalProperties"], False)
+        self.assertNotIn(
+            "format",
+            payload["tools"][0]["parameters"]["properties"]["url"],
+        )
 
     def test_websocket_request_does_not_forward_internal_session_metadata_keys(self) -> None:
         route = build_upstream_route(
@@ -1371,6 +1419,32 @@ class UpstreamAdapterTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["metadata"], {"foo": "bar"})
 
+    def test_websocket_request_includes_prompt_cache_key(self) -> None:
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+                prompt_cache_enabled=True,
+                prompt_cache_bucket_id="bucket-123",
+            )
+        )
+        payload, error = LiteLLMUpstreamAdapter._build_openai_responses_websocket_request(
+            route=route,
+            request_data={
+                "messages": [{"role": "user", "content": "你好"}],
+                "metadata": {"session_id": "conversation-123"},
+            },
+        )
+
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertEqual(
+            payload["prompt_cache_key"],
+            f"{route.prompt_cache_key}:meta:conversation-123",
+        )
+
     def test_websocket_turn_with_tool_output_uses_full_history_new_chain(self) -> None:
         adapter = LiteLLMUpstreamAdapter(
             disable_ssl_strict_mode=False,
@@ -1382,6 +1456,7 @@ class UpstreamAdapterTests(unittest.TestCase):
                 target_api_base_url="https://api.openai.com",
                 target_model_id="gpt-5.4",
                 websocket_mode_enabled=True,
+                prompt_cache_bucket_id="bucket-123",
             )
         )
         session = ResponsesWebSocketSessionState(
@@ -1443,6 +1518,10 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertNotIn("previous_response_id", payload)
         self.assertEqual(payload["input"][1]["type"], "function_call")
         self.assertEqual(payload["input"][2]["type"], "function_call_output")
+        self.assertEqual(
+            payload["prompt_cache_key"],
+            f"{route.prompt_cache_key}:ws:{session.session_id}",
+        )
 
     def test_websocket_stream_self_heals_unsupported_schema_keyword_before_output(self) -> None:
         logs: list[str] = []

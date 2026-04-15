@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,7 @@ OPENAI_UNSUPPORTED_STRICT_SCHEMA_KEYS: frozenset[str] = frozenset(
         "if",
         "then",
         "else",
+        "format",
         "propertyNames",
         "uniqueItems",
         "contains",
@@ -280,6 +282,8 @@ class LiteLLMUpstreamAdapter:
         self._param_self_heal = UpstreamParamSelfHealController()
         self._websocket_sessions: dict[str, ResponsesWebSocketSessionState] = {}
         self._websocket_sessions_lock = threading.RLock()
+        self._websocket_session_history_index: dict[str, set[str]] = {}
+        self._websocket_session_history_hashes: dict[str, set[str]] = {}
 
     def build_route(
         self,
@@ -313,6 +317,44 @@ class LiteLLMUpstreamAdapter:
             return [param for param in supported_params if isinstance(param, str)]
         except Exception:
             return None
+
+    @staticmethod
+    def _build_request_prompt_cache_key(
+        *,
+        route: UpstreamRoute,
+        request_data: dict[str, Any],
+        session: ResponsesWebSocketSessionState | None = None,
+    ) -> str | None:
+        if not route.prompt_cache_enabled or not route.prompt_cache_key:
+            return None
+        if session is not None:
+            return f"{route.prompt_cache_key}:ws:{session.session_id}"
+        metadata_obj = request_data.get("metadata")
+        if isinstance(metadata_obj, dict):
+            metadata = cast(dict[str, Any], metadata_obj)
+            for key in (
+                "mtga_ws_session_id",
+                "mtga_session_id",
+                "session_id",
+                "conversation_id",
+                "chat_id",
+                "thread_id",
+            ):
+                value_obj = metadata.get(key)
+                if isinstance(value_obj, str) and value_obj.strip():
+                    return f"{route.prompt_cache_key}:meta:{value_obj.strip()}"
+        messages_obj = request_data.get("messages")
+        if isinstance(messages_obj, list):
+            message_items: list[dict[str, Any]] = []
+            for item in cast(list[Any], messages_obj):
+                if isinstance(item, dict):
+                    message_items.append(cast(dict[str, Any], item))
+            if message_items:
+                anchor_hash = _build_prompt_cache_key(
+                    LiteLLMUpstreamAdapter._build_messages_history_hash(message_items[:2])
+                )[:16]
+                return f"{route.prompt_cache_key}:anon:{anchor_hash}"
+        return route.prompt_cache_key
 
     @staticmethod
     def _strip_optional_request_params(call_kwargs: dict[str, Any]) -> None:
@@ -381,6 +423,12 @@ class LiteLLMUpstreamAdapter:
                 call_kwargs=call_kwargs,
                 allowed_params=top_level_params,
             )
+        prompt_cache_key = self._build_request_prompt_cache_key(
+            route=route,
+            request_data=request_data,
+        )
+        if prompt_cache_key is not None:
+            call_kwargs["prompt_cache_key"] = prompt_cache_key
         return call_kwargs
 
     def _normalize_provider_chat_request(
@@ -540,6 +588,16 @@ class LiteLLMUpstreamAdapter:
         return [cast(dict[str, Any], item) for item in cloned if isinstance(item, dict)]
 
     @staticmethod
+    def _build_messages_history_hash(messages: list[dict[str, Any]]) -> str:
+        normalized = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _messages_extend_prefix(
         previous_messages: list[dict[str, Any]],
         current_messages: list[dict[str, Any]],
@@ -621,11 +679,39 @@ class LiteLLMUpstreamAdapter:
                 stale_sessions.append(session)
         return stale_sessions
 
+    def _register_websocket_session_history(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        if not messages:
+            return
+        history_hash = self._build_messages_history_hash(messages)
+        with self._websocket_sessions_lock:
+            session_hashes = self._websocket_session_history_hashes.setdefault(session_id, set())
+            if history_hash in session_hashes:
+                return
+            session_hashes.add(history_hash)
+            self._websocket_session_history_index.setdefault(history_hash, set()).add(session_id)
+
+    def _unregister_websocket_session_history(self, *, session_id: str) -> None:
+        with self._websocket_sessions_lock:
+            history_hashes = self._websocket_session_history_hashes.pop(session_id, set())
+            for history_hash in history_hashes:
+                session_ids = self._websocket_session_history_index.get(history_hash)
+                if session_ids is None:
+                    continue
+                session_ids.discard(session_id)
+                if not session_ids:
+                    self._websocket_session_history_index.pop(history_hash, None)
+
     def _prune_websocket_sessions(self) -> None:
         now = time.time()
         with self._websocket_sessions_lock:
             stale_sessions = self._collect_stale_websocket_sessions_locked(now=now)
         for session in stale_sessions:
+            self._unregister_websocket_session_history(session_id=session.session_id)
             with session.lock:
                 self._close_websocket_session(session)
                 self._reset_websocket_session_chain(session)
@@ -645,6 +731,7 @@ class LiteLLMUpstreamAdapter:
                 if removed is not None:
                     sessions_to_close.append(removed)
         for session in sessions_to_close:
+            self._unregister_websocket_session_history(session_id=session.session_id)
             with session.lock:
                 self._close_websocket_session(session)
                 self._reset_websocket_session_chain(session)
@@ -717,7 +804,21 @@ class LiteLLMUpstreamAdapter:
         self,
         *,
         current_messages: list[dict[str, Any]],
-    ) -> tuple[ResponsesWebSocketSessionState | None, int, int]:
+    ) -> tuple[ResponsesWebSocketSessionState | None, int, int, str | None]:
+        with self._websocket_sessions_lock:
+            for prefix_len in range(len(current_messages), 0, -1):
+                history_hash = self._build_messages_history_hash(current_messages[:prefix_len])
+                candidate_ids = self._websocket_session_history_index.get(history_hash, set())
+                active_candidates = [
+                    self._websocket_sessions[session_id]
+                    for session_id in candidate_ids
+                    if session_id in self._websocket_sessions
+                ]
+                if len(active_candidates) == 1:
+                    return active_candidates[0], prefix_len, 1, "history_index"
+                if len(active_candidates) > 1:
+                    return None, prefix_len, len(active_candidates), "history_index"
+
         best_session: ResponsesWebSocketSessionState | None = None
         best_prefix_len = -1
         best_match_count = 0
@@ -735,8 +836,8 @@ class LiteLLMUpstreamAdapter:
             if prefix_len == best_prefix_len:
                 best_match_count += 1
         if best_match_count == 1:
-            return best_session, best_prefix_len, best_match_count
-        return None, best_prefix_len, best_match_count
+            return best_session, best_prefix_len, best_match_count, "conversation_state"
+        return None, best_prefix_len, best_match_count, "conversation_state"
 
     def _get_or_create_websocket_session(
         self,
@@ -750,6 +851,7 @@ class LiteLLMUpstreamAdapter:
         selection_reason = "unknown"
         matched_prefix_len = 0
         matched_candidates = 0
+        matched_source = "none"
         with self._websocket_sessions_lock:
             if explicit_key is not None:
                 session = self._websocket_sessions.get(explicit_key)
@@ -765,14 +867,18 @@ class LiteLLMUpstreamAdapter:
                     selection_reason = "explicit_reuse"
                 selected_session = session
             else:
-                matched_session, matched_prefix_len, matched_candidates = (
+                matched_session, matched_prefix_len, matched_candidates, matched_source = (
                     self._find_matching_websocket_session(
                         current_messages=current_messages
                     )
                 )
                 if matched_session is not None:
                     selected_session = matched_session
-                    selection_reason = "matched_prefix"
+                    selection_reason = (
+                        "matched_history_prefix"
+                        if matched_source == "history_index"
+                        else "matched_prefix"
+                    )
                 else:
                     session = ResponsesWebSocketSessionState(
                         session_id=self._new_websocket_session_id(),
@@ -789,6 +895,11 @@ class LiteLLMUpstreamAdapter:
 
         if new_session_created:
             self._enforce_websocket_session_capacity()
+        selected_session.last_used_at = time.time()
+        self._register_websocket_session_history(
+            session_id=selected_session.session_id,
+            messages=current_messages,
+        )
         self._log(
             "OpenAI Responses WebSocket 会话选择: "
             f"session={selected_session.session_id} "
@@ -796,7 +907,8 @@ class LiteLLMUpstreamAdapter:
             f"explicit={selected_session.explicit_session_key} "
             f"message_count={len(current_messages)} "
             f"matched_prefix_len={max(matched_prefix_len, 0)} "
-            f"matched_candidates={matched_candidates}"
+            f"matched_candidates={matched_candidates} "
+            f"matched_source={matched_source}"
         )
         return selected_session
 
@@ -1196,7 +1308,7 @@ class LiteLLMUpstreamAdapter:
         return input_items, instructions, None
 
     @classmethod
-    def _build_openai_responses_websocket_request(
+    def _build_openai_responses_websocket_request(  # noqa: PLR0912
         cls,
         *,
         route: UpstreamRoute,
@@ -1252,6 +1364,13 @@ class LiteLLMUpstreamAdapter:
         sanitized_metadata = cls._sanitize_websocket_metadata_for_upstream(metadata)
         if sanitized_metadata is not None:
             payload["metadata"] = sanitized_metadata
+
+        prompt_cache_key = cls._build_request_prompt_cache_key(
+            route=route,
+            request_data=request_data,
+        )
+        if prompt_cache_key is not None:
+            payload["prompt_cache_key"] = prompt_cache_key
 
         if "reasoning_effort" in request_data:
             payload["reasoning"] = {"effort": request_data["reasoning_effort"]}
@@ -1330,6 +1449,14 @@ class LiteLLMUpstreamAdapter:
         )
         if payload is None:
             return None, False, error
+
+        prompt_cache_key = self._build_request_prompt_cache_key(
+            route=route,
+            request_data=turn_request_data,
+            session=session,
+        )
+        if prompt_cache_key is not None:
+            payload["prompt_cache_key"] = prompt_cache_key
 
         if continue_with_previous and session.last_response_id:
             payload["previous_response_id"] = session.last_response_id
@@ -1538,6 +1665,10 @@ class LiteLLMUpstreamAdapter:
                 session.last_response_connection_started_at = session.connection_started_at
                 session.conversation_messages = updated_messages
                 session.last_used_at = time.time()
+                self._register_websocket_session_history(
+                    session_id=session.session_id,
+                    messages=updated_messages,
+                )
                 yield self._build_openai_chat_delta_chunk(
                     response_id=response_id,
                     created=created or now_ts(),
