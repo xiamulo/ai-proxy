@@ -742,6 +742,10 @@ class ProxyApp:
                 f"request_api={route.request_api} model={route.litellm_model} "
                 f"base_url={route.base_url}"
             )
+            if route.prompt_cache_enabled:
+                log(f"Prompt Cache: enabled key={route.prompt_cache_key}")
+            else:
+                log("Prompt Cache: disabled")
             if route.litellm_base_url and route.litellm_base_url != route.base_url:
                 log(f"LiteLLM 内部基路径: {route.litellm_base_url}")
 
