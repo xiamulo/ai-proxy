@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
-from typing import Any
+from typing import Any, get_origin
 from unittest.mock import patch
 
 import httpx
@@ -22,6 +22,7 @@ from modules.proxy.proxy_config import (
 from modules.proxy.upstream_adapter import (
     CHAT_COMPLETIONS_REQUEST_API,
     LiteLLMUpstreamAdapter,
+    OpenAIWebSocketConnectionOptions,
     ResponsesWebSocketSessionError,
     ResponsesWebSocketSessionState,
     build_upstream_route,
@@ -101,6 +102,9 @@ def _build_bad_request_error(
 
 
 class UpstreamRouteTests(unittest.TestCase):
+    def test_openai_websocket_connection_options_type_is_runtime_safe(self) -> None:
+        self.assertIs(get_origin(OpenAIWebSocketConnectionOptions), dict)
+
     def test_build_proxy_config_ignores_legacy_group_mapped_model_id(self) -> None:
         temp_dir = tempfile.mkdtemp(prefix="mtga-proxy-config-")
         resource_manager = DummyResourceManager(

@@ -11,11 +11,17 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import litellm
 from openai import OpenAI
-from openai.types.websocket_connection_options import WebSocketConnectionOptions
+
+if TYPE_CHECKING:
+    from openai.types.websocket_connection_options import (
+        WebSocketConnectionOptions as OpenAIWebSocketConnectionOptions,
+    )
+else:
+    OpenAIWebSocketConnectionOptions = dict[str, Any]
 
 from modules.proxy.proxy_config import (
     OPENAI_CHAT_COMPLETION_PROVIDER,
@@ -892,7 +898,7 @@ class LiteLLMUpstreamAdapter:
         client = OpenAI(api_key=route.api_key, base_url=route.base_url)
         connection_context = client.responses.connect(
             websocket_connection_options=cast(
-                WebSocketConnectionOptions,
+                OpenAIWebSocketConnectionOptions,
                 OPENAI_RESPONSES_WEBSOCKET_CONNECTION_OPTIONS,
             )
         )

@@ -9,6 +9,7 @@ dependencies = [
     "pytauri-wheel==0.8.*",
     "cryptography>=45.0.0",
     "flask",
+    "openai==2.31.0",
     "requests",
     "platformdirs>=4.3.0",
     "PyYAML",
