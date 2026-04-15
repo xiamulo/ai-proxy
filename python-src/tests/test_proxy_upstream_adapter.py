@@ -799,6 +799,86 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "你好")
         self.assertTrue(any("WebSocket 预热" in item for item in logs))
 
+    def test_websocket_session_skips_prewarm_when_sdk_create_lacks_generate(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+                prompt_cache_enabled=True,
+                prompt_cache_bucket_id="bucket-123",
+            )
+        )
+        created_payloads: list[dict[str, Any]] = []
+        connect_calls = 0
+        events = [
+            {"type": "response.created", "response": {"id": "resp_1", "created_at": 2}},
+            {"type": "response.output_text.delta", "delta": "你好"},
+            {"type": "response.completed"},
+        ]
+
+        class FakeResponseResource:
+            def create(self, **kwargs: Any) -> None:
+                created_payloads.append(kwargs)
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.response = FakeResponseResource()
+
+            def __iter__(self) -> Any:
+                return iter(events)
+
+        class FakeConnectionContext:
+            def __init__(self) -> None:
+                self._connection = FakeConnection()
+
+            def __enter__(self) -> FakeConnection:
+                nonlocal connect_calls
+                connect_calls += 1
+                return self._connection
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        class FakeResponses:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
+                return FakeConnectionContext()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = FakeResponses()
+
+        with (
+            patch("modules.proxy.upstream_adapter.OpenAI", return_value=FakeClient()),
+            patch.object(
+                adapter,
+                "_websocket_response_create_supports_generate",
+                return_value=False,
+            ),
+        ):
+            stream = adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "stream": True,
+                },
+            )
+            chunks = list(stream)
+
+        self.assertEqual(connect_calls, 1)
+        self.assertEqual(len(created_payloads), 1)
+        self.assertNotIn("generate", created_payloads[0])
+        self.assertNotEqual(created_payloads[0]["input"], [])
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "你好")
+        self.assertTrue(any("跳过预热" in item for item in logs))
+        self.assertFalse(any("已锁定回退 HTTP" in item for item in logs))
+
     def test_websocket_session_skips_previous_response_id_when_request_signature_changes(
         self,
     ) -> None:
@@ -1168,6 +1248,165 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertEqual(created_payloads[1]["previous_response_id"], "resp_1")
         self.assertNotIn("previous_response_id", created_payloads[2])
         self.assertTrue(any("code=previous_response_not_found" in item for item in logs))
+
+    def test_websocket_session_retries_third_party_handshake_with_model_query(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://example-proxy.test",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        connect_kwargs_list: list[dict[str, Any]] = []
+        created_payloads: list[dict[str, Any]] = []
+
+        class FakeHandshakeError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("Handshake failed with status 403")
+                self.status_code = 403
+
+        class FakeResponseResource:
+            def create(self, **kwargs: Any) -> None:
+                created_payloads.append(kwargs)
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.response = FakeResponseResource()
+
+            def __iter__(self) -> Any:
+                return iter(
+                    [
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_ok", "created_at": 1},
+                        },
+                        {"type": "response.output_text.delta", "delta": "完成"},
+                        {"type": "response.completed"},
+                    ]
+                )
+
+        class FakeConnectionContext:
+            def __enter__(self) -> FakeConnection:
+                return FakeConnection()
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        class FakeResponses:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
+                self.calls += 1
+                connect_kwargs_list.append(kwargs)
+                if self.calls == 1:
+                    raise FakeHandshakeError()
+                return FakeConnectionContext()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = FakeResponses()
+
+        with patch("modules.proxy.upstream_adapter.OpenAI", return_value=FakeClient()):
+            chunks = list(
+                adapter.create_chat_completion(
+                    route=route,
+                    request_data={
+                        "messages": [{"role": "user", "content": "你好"}],
+                        "stream": True,
+                    },
+                )
+            )
+
+        self.assertEqual(len(connect_kwargs_list), 2)
+        self.assertNotIn("extra_query", connect_kwargs_list[0])
+        self.assertEqual(connect_kwargs_list[1]["extra_query"], {"model": "gpt-5.4"})
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "完成")
+        self.assertTrue(any("建连失败" in item for item in logs))
+        self.assertTrue(any("代理兼容重试" in item for item in logs))
+
+    def test_websocket_session_retries_without_sampling_after_empty_close(self) -> None:
+        logs: list[str] = []
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=logs.append,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_RESPONSE_PROVIDER,
+                target_api_base_url="https://api.openai.com",
+                target_model_id="gpt-5.4",
+                websocket_mode_enabled=True,
+            )
+        )
+        created_payloads: list[dict[str, Any]] = []
+        current_batch = 0
+        event_batches = [
+            [],
+            [
+                {"type": "response.created", "response": {"id": "resp_ok", "created_at": 2}},
+                {"type": "response.output_text.delta", "delta": "恢复成功"},
+                {"type": "response.completed"},
+            ],
+        ]
+
+        class FakeResponseResource:
+            def create(self, **kwargs: Any) -> None:
+                created_payloads.append(kwargs)
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.response = FakeResponseResource()
+
+            def __iter__(self) -> Any:
+                nonlocal current_batch
+                batch = event_batches[current_batch]
+                current_batch += 1
+                return iter(batch)
+
+        class FakeConnectionContext:
+            def __enter__(self) -> FakeConnection:
+                return FakeConnection()
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        class FakeResponses:
+            def connect(self, **kwargs: Any) -> FakeConnectionContext:
+                return FakeConnectionContext()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = FakeResponses()
+
+        with patch("modules.proxy.upstream_adapter.OpenAI", return_value=FakeClient()):
+            chunks = list(
+                adapter.create_chat_completion(
+                    route=route,
+                    request_data={
+                        "messages": [{"role": "user", "content": "你好"}],
+                        "stream": True,
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "stream_options": {"include_usage": True},
+                    },
+                )
+            )
+
+        self.assertEqual(len(created_payloads), 2)
+        self.assertIn("temperature", created_payloads[0])
+        self.assertIn("top_p", created_payloads[0])
+        self.assertNotIn("temperature", created_payloads[1])
+        self.assertNotIn("top_p", created_payloads[1])
+        self.assertNotIn("stream_options", created_payloads[1])
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "恢复成功")
+        self.assertTrue(any("空响应关闭，移除采样参数重试" in item for item in logs))
 
     def test_websocket_route_sticky_fallback_skips_second_websocket_attempt(self) -> None:
         logs: list[str] = []

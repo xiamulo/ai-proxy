@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+from urllib.parse import urlparse
 
 import litellm
 from openai import OpenAI
@@ -41,6 +43,7 @@ type RequestApi = Literal["chat_completions", "responses"]
 
 CHAT_COMPLETIONS_REQUEST_API: RequestApi = "chat_completions"
 RESPONSES_REQUEST_API: RequestApi = "responses"
+HTTP_FORBIDDEN = 403
 LITELLM_CONNECT_RETRY_COUNT = 2
 UPSTREAM_PARAM_SELF_HEAL_MAX_ATTEMPTS = 3
 WEBSOCKET_SESSION_IDLE_TIMEOUT_SECONDS = 15 * 60
@@ -174,6 +177,7 @@ class ResponsesWebSocketSessionState:
     last_request_signature: str | None = None
     prompt_cache_scope: str | None = None
     prewarmed_messages_hash: str | None = None
+    websocket_extra_query: dict[str, Any] | None = None
     conversation_messages: list[dict[str, Any]] = field(
         default_factory=lambda: cast(list[dict[str, Any]], [])
     )
@@ -896,13 +900,45 @@ class LiteLLMUpstreamAdapter:
             )
         self._close_websocket_session(session)
         client = OpenAI(api_key=route.api_key, base_url=route.base_url)
-        connection_context = client.responses.connect(
-            websocket_connection_options=cast(
+        connect_kwargs: dict[str, Any] = {
+            "websocket_connection_options": cast(
                 OpenAIWebSocketConnectionOptions,
                 OPENAI_RESPONSES_WEBSOCKET_CONNECTION_OPTIONS,
             )
-        )
-        connection = connection_context.__enter__()
+        }
+        if session.websocket_extra_query:
+            connect_kwargs["extra_query"] = session.websocket_extra_query
+        try:
+            connection_context = client.responses.connect(**connect_kwargs)
+            connection = connection_context.__enter__()
+        except Exception as exc:
+            status_code = self._extract_websocket_status_code(exc)
+            self._log(
+                "OpenAI Responses WebSocket 建连失败: "
+                f"session={session.session_id} "
+                f"url={route.base_url}/responses "
+                f"status={status_code if status_code is not None else 'unknown'} "
+                f"error={exc}"
+            )
+            can_retry_with_model_query = (
+                session.websocket_extra_query is None
+                and self._should_retry_websocket_with_model_query(route=route, exc=exc)
+            )
+            if not can_retry_with_model_query:
+                raise
+            session.websocket_extra_query = {"model": route.litellm_model}
+            self._log(
+                "OpenAI Responses WebSocket 代理兼容重试: "
+                f"session={session.session_id} extra_query_model={route.litellm_model}"
+            )
+            connection_context = client.responses.connect(
+                extra_query=session.websocket_extra_query,
+                websocket_connection_options=cast(
+                    OpenAIWebSocketConnectionOptions,
+                    OPENAI_RESPONSES_WEBSOCKET_CONNECTION_OPTIONS,
+                ),
+            )
+            connection = connection_context.__enter__()
         now = time.time()
         session.client = client
         session.connection_context = connection_context
@@ -1736,6 +1772,12 @@ class LiteLLMUpstreamAdapter:
         payload: dict[str, Any],
         current_messages: list[dict[str, Any]],
     ) -> None:
+        if not self._websocket_response_create_supports_generate(session):
+            self._log(
+                "OpenAI Responses WebSocket 跳过预热: "
+                f"session={session.session_id} reason=sdk_missing_generate"
+            )
+            return
         prewarm_payload = copy.deepcopy(payload)
         prewarm_payload["generate"] = False
         self._log(
@@ -1751,6 +1793,28 @@ class LiteLLMUpstreamAdapter:
         ):
             pass
         session.prewarmed_messages_hash = self._build_messages_history_hash(current_messages)
+
+    @staticmethod
+    def _websocket_response_create_supports_generate(
+        session: ResponsesWebSocketSessionState,
+    ) -> bool:
+        connection = session.connection
+        if connection is None:
+            return False
+        response_resource = getattr(connection, "response", None)
+        if response_resource is None:
+            return False
+        create = getattr(response_resource, "create", None)
+        if not callable(create):
+            return False
+        try:
+            signature = inspect.signature(create)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters.values()
+        if any(parameter.name == "generate" for parameter in parameters):
+            return True
+        return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
 
     @staticmethod
     def _extract_unsupported_schema_keyword(error: Exception) -> str | None:
@@ -1800,6 +1864,7 @@ class LiteLLMUpstreamAdapter:
         created = 0
         function_calls: dict[str, ResponsesWebSocketFunctionCallState] = {}
         saw_function_call = False
+        saw_any_event = False
         assistant_content_parts: list[str] = []
         assistant_tool_calls: list[dict[str, Any]] = []
 
@@ -1809,6 +1874,7 @@ class LiteLLMUpstreamAdapter:
         if create_request:
             connection.response.create(**payload)
         for event in connection:
+            saw_any_event = True
             event_payload = _coerce_model_dump(event)
             if event_payload is None:
                 continue
@@ -1976,6 +2042,15 @@ class LiteLLMUpstreamAdapter:
                 code_obj = error_payload.get("code")
                 code = code_obj.strip() if isinstance(code_obj, str) and code_obj.strip() else None
                 raise ResponsesWebSocketSessionError(message, code=code, status=status)
+        if not saw_any_event:
+            raise ResponsesWebSocketSessionError(
+                "OpenAI Responses WebSocket 在没有任何事件输出前关闭",
+                code="websocket_closed_before_events",
+            )
+        raise ResponsesWebSocketSessionError(
+            "OpenAI Responses WebSocket 在响应完成前关闭",
+            code="websocket_closed_mid_stream",
+        )
 
     def _create_openai_responses_websocket_stream(  # noqa: PLR0915
         self,
@@ -1998,6 +2073,7 @@ class LiteLLMUpstreamAdapter:
             schema_self_heal_attempts = 0
             unsupported_param_self_heal_attempts = 0
             recoverable_session_attempts = 0
+            empty_close_sampling_retry_attempts = 0
             with session.lock:
                 while True:
                     emitted_output = False
@@ -2087,6 +2163,35 @@ class LiteLLMUpstreamAdapter:
                             "previous_response_not_found",
                             "websocket_connection_limit_reached",
                         }
+                        can_retry_without_sampling = (
+                            not emitted_output
+                            and exc.code == "websocket_closed_before_events"
+                            and empty_close_sampling_retry_attempts < 1
+                            and self._should_retry_without_sampling(
+                                request_data=request_data,
+                                stripped_top_level_keys=dynamic_stripped_top_level_keys,
+                            )
+                        )
+                        if can_retry_without_sampling:
+                            empty_close_sampling_retry_attempts += 1
+                            sampling_keys = self._get_sampling_retry_keys(
+                                request_data=request_data,
+                                stripped_top_level_keys=dynamic_stripped_top_level_keys,
+                            )
+                            dynamic_stripped_top_level_keys.update(sampling_keys)
+                            self._log(
+                                "OpenAI Responses WebSocket 空响应关闭，移除采样参数重试: "
+                                f"session={session.session_id} "
+                                f"drop_keys={','.join(sorted(sampling_keys))} "
+                                f"params={self._build_sampling_param_log(request_data)}"
+                            )
+                            self._close_websocket_session(session)
+                            self._open_websocket_session_connection(
+                                session=session,
+                                route=route,
+                                reconnect_reason="empty_close_sampling_retry",
+                            )
+                            continue
                         if (
                             emitted_output
                             or exc.code not in recoverable_codes
@@ -2138,6 +2243,80 @@ class LiteLLMUpstreamAdapter:
                         raise
 
         return generate()
+
+    @staticmethod
+    def _extract_websocket_status_code(exc: Exception) -> int | None:
+        for attr_name in ("status_code", "status"):
+            value = getattr(exc, attr_name, None)
+            if isinstance(value, int):
+                return value
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        match = re.search(r"\b(4\d{2}|5\d{2})\b", str(exc))
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    @staticmethod
+    def _is_official_openai_route(route: UpstreamRoute) -> bool:
+        try:
+            parsed = urlparse(route.base_url)
+        except Exception:
+            return False
+        host = (parsed.hostname or "").lower()
+        return host in {"api.openai.com", "api.openai.azure.com"}
+
+    def _should_retry_websocket_with_model_query(
+        self,
+        *,
+        route: UpstreamRoute,
+        exc: Exception,
+    ) -> bool:
+        if self._is_official_openai_route(route):
+            return False
+        status_code = self._extract_websocket_status_code(exc)
+        message = str(exc).lower()
+        if status_code == HTTP_FORBIDDEN:
+            return True
+        return "handshake" in message and str(HTTP_FORBIDDEN) in message
+
+    @staticmethod
+    def _get_sampling_retry_keys(
+        *,
+        request_data: dict[str, Any],
+        stripped_top_level_keys: set[str],
+    ) -> set[str]:
+        retryable_keys = {"temperature", "top_p", "stream_options"}
+        result: set[str] = set()
+        for key in retryable_keys:
+            if key in stripped_top_level_keys:
+                continue
+            if key in request_data:
+                result.add(key)
+        return result
+
+    def _should_retry_without_sampling(
+        self,
+        *,
+        request_data: dict[str, Any],
+        stripped_top_level_keys: set[str],
+    ) -> bool:
+        return bool(
+            self._get_sampling_retry_keys(
+                request_data=request_data,
+                stripped_top_level_keys=stripped_top_level_keys,
+            )
+        )
+
+    @staticmethod
+    def _build_sampling_param_log(request_data: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("temperature", "top_p", "stream_options"):
+            if key in request_data:
+                parts.append(f"{key}={request_data[key]}")
+        return ", ".join(parts) if parts else "none"
 
     @staticmethod
     def _build_request_ssl_verify(
