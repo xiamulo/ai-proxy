@@ -27,11 +27,46 @@ CONFIG_GROUP_ALLOWED_KEYS = frozenset(
         "api_key",
         "middle_route",
         "model_discovery_strategy",
+        "reasoning_effort",
         "prompt_cache_enabled",
         "request_params_enabled",
         "websocket_mode_enabled",
     }
 )
+
+SUPPORTED_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
+
+
+def _default_reasoning_effort(*, provider: str | None, model_id: str | None) -> str | None:
+    normalized_provider = normalize_provider(provider)
+    normalized_model_id = model_id.strip().lower() if isinstance(model_id, str) else ""
+    is_openai_gpt_54 = (
+        normalized_provider in {"openai_chat_completion", "openai_response"}
+        and normalized_model_id == "gpt-5.4"
+    )
+    if is_openai_gpt_54:
+        return "high"
+    return None
+
+
+def _normalize_toggle(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "off", "no"}
+    return bool(value) if value is not None else default
+
+
+def _normalize_reasoning_effort(
+    value: Any,
+    *,
+    provider: str | None,
+    model_id: str | None,
+) -> str | None:
+    if isinstance(value, str):
+        normalized_effort = value.strip().lower()
+        return normalized_effort if normalized_effort in SUPPORTED_REASONING_EFFORTS else None
+    return _default_reasoning_effort(provider=provider, model_id=model_id)
 
 
 def _should_enable_websocket_mode_by_default(*, provider: str | None, model_id: str | None) -> bool:
@@ -56,47 +91,28 @@ def _normalize_config_group(raw_group: Any) -> dict[str, Any] | None:
     normalized["model_discovery_strategy"] = normalize_model_discovery_strategy(
         strategy if isinstance(strategy, str) else None
     )
-    prompt_cache_enabled = normalized.get("prompt_cache_enabled")
-    if isinstance(prompt_cache_enabled, str):
-        normalized["prompt_cache_enabled"] = prompt_cache_enabled.strip().lower() not in {
-            "false",
-            "0",
-            "off",
-            "no",
-        }
-    elif isinstance(prompt_cache_enabled, bool):
-        normalized["prompt_cache_enabled"] = prompt_cache_enabled
-    else:
-        normalized["prompt_cache_enabled"] = False
-
-    request_params_enabled = normalized.get("request_params_enabled")
-    if isinstance(request_params_enabled, str):
-        normalized["request_params_enabled"] = request_params_enabled.strip().lower() not in {
-            "false",
-            "0",
-            "off",
-            "no",
-        }
-    elif isinstance(request_params_enabled, bool):
-        normalized["request_params_enabled"] = request_params_enabled
-    else:
-        normalized["request_params_enabled"] = True
-
+    normalized["reasoning_effort"] = _normalize_reasoning_effort(
+        normalized.get("reasoning_effort"),
+        provider=cast(str | None, normalized.get("provider")),
+        model_id=cast(str | None, normalized.get("model_id")),
+    )
+    normalized["prompt_cache_enabled"] = _normalize_toggle(
+        normalized.get("prompt_cache_enabled"),
+        default=False,
+    )
+    normalized["request_params_enabled"] = _normalize_toggle(
+        normalized.get("request_params_enabled"),
+        default=True,
+    )
     websocket_mode_enabled = normalized.get("websocket_mode_enabled")
-    if isinstance(websocket_mode_enabled, str):
-        normalized["websocket_mode_enabled"] = websocket_mode_enabled.strip().lower() not in {
-            "false",
-            "0",
-            "off",
-            "no",
-        }
-    elif isinstance(websocket_mode_enabled, bool):
-        normalized["websocket_mode_enabled"] = websocket_mode_enabled
-    else:
-        normalized["websocket_mode_enabled"] = _should_enable_websocket_mode_by_default(
+    normalized["websocket_mode_enabled"] = (
+        _normalize_toggle(websocket_mode_enabled, default=False)
+        if isinstance(websocket_mode_enabled, (bool, str))
+        else _should_enable_websocket_mode_by_default(
             provider=cast(str | None, normalized.get("provider")),
             model_id=cast(str | None, normalized.get("model_id")),
         )
+    )
     return normalized
 
 

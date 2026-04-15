@@ -495,6 +495,11 @@ class LiteLLMUpstreamAdapter:
         call_kwargs: dict[str, Any] = dict(request_data)
         if not route.request_params_enabled:
             self._strip_optional_request_params(call_kwargs)
+            if (
+                route.litellm_model.strip().lower() == OPENAI_RESPONSES_WEBSOCKET_MODEL_ID
+                and "reasoning_effort" in request_data
+            ):
+                call_kwargs["reasoning_effort"] = request_data["reasoning_effort"]
             return call_kwargs
         supported_params = self._get_supported_openai_params(
             route,

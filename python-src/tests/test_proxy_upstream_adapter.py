@@ -311,6 +311,38 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", call_kwargs)
         self.assertNotIn("metadata", call_kwargs)
 
+    def test_openai_gpt_5_4_keeps_reasoning_effort_when_request_params_disabled(self) -> None:
+        adapter = LiteLLMUpstreamAdapter(
+            disable_ssl_strict_mode=False,
+            log_func=lambda _message: None,
+        )
+        route = build_upstream_route(
+            _build_proxy_config(
+                provider=OPENAI_CHAT_COMPLETION_PROVIDER,
+                target_api_base_url="https://example.com",
+                target_model_id="gpt-5.4",
+                request_params_enabled=False,
+            )
+        )
+
+        with patch(
+            "modules.proxy.upstream_adapter._create_litellm_completion",
+            return_value={"id": "chatcmpl_123", "choices": []},
+        ) as completion_mock:
+            adapter.create_chat_completion(
+                route=route,
+                request_data={
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "temperature": 0.1,
+                    "reasoning_effort": "high",
+                },
+            )
+
+        call_kwargs = completion_mock.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "gpt-5.4")
+        self.assertNotIn("temperature", call_kwargs)
+        self.assertEqual(call_kwargs["reasoning_effort"], "high")
+
     def test_anthropic_uses_custom_base_url_without_openai_provider_override(self) -> None:
         adapter = LiteLLMUpstreamAdapter(
             disable_ssl_strict_mode=False,

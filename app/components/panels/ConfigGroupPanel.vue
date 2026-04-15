@@ -37,6 +37,7 @@ const form = reactive({
   model_id: "",
   api_key: "",
   middle_route: "",
+  reasoning_effort: "high" as "none" | "low" | "medium" | "high" | "xhigh",
   prompt_cache_enabled: false,
   request_params_enabled: true,
   websocket_mode_enabled: false,
@@ -253,6 +254,7 @@ const resetForm = () => {
   form.model_id = "";
   form.api_key = "";
   form.middle_route = "";
+  form.reasoning_effort = "high";
   form.prompt_cache_enabled = false;
   form.request_params_enabled = true;
   form.websocket_mode_enabled = false;
@@ -285,6 +287,7 @@ const openEdit = () => {
   form.model_id = group.model_id || "";
   form.api_key = group.api_key || "";
   form.middle_route = group.middle_route || "";
+  form.reasoning_effort = group.reasoning_effort || "high";
   form.prompt_cache_enabled = group.prompt_cache_enabled ?? false;
   form.request_params_enabled = group.request_params_enabled ?? true;
   form.websocket_mode_enabled = group.websocket_mode_enabled ?? false;
@@ -329,6 +332,7 @@ const handleSave = async () => {
     api_url: normalizeApiUrl(form.api_url),
     model_id: form.model_id.trim(),
     api_key: form.api_key.trim(),
+    reasoning_effort: isGpt54OpenAiForm.value ? form.reasoning_effort : undefined,
     prompt_cache_enabled: form.prompt_cache_enabled,
     request_params_enabled: form.request_params_enabled,
     websocket_mode_enabled: isGpt54OpenAiForm.value ? form.websocket_mode_enabled : false,
@@ -644,6 +648,9 @@ const moveDown = async () => {
               </div>
               <div class="flex flex-wrap gap-2">
                 <span class="mtga-chip">{{ configGroups[selectedIndex]?.model_id }}</span>
+                <span v-if="isGpt54OpenAiGroup(configGroups[selectedIndex]!)" class="mtga-chip">
+                  {{ `思考:${configGroups[selectedIndex]?.reasoning_effort || "high"}` }}
+                </span>
                 <span
                   v-if="configGroups[selectedIndex]?.request_params_enabled ?? true"
                   class="mtga-chip"
@@ -687,6 +694,14 @@ const moveDown = async () => {
                 <span class="break-all text-sm text-slate-300">{{
                   configGroups[selectedIndex]?.middle_route ||
                   getDefaultMiddleRoute(normalizeProvider(configGroups[selectedIndex]?.provider))
+                }}</span>
+              </div>
+              <div class="flex items-baseline gap-3">
+                <span class="shrink-0 text-xs font-medium text-slate-500 w-16">思考强度</span>
+                <span class="text-sm text-slate-300">{{
+                  isGpt54OpenAiGroup(configGroups[selectedIndex]!)
+                    ? configGroups[selectedIndex]?.reasoning_effort || "high"
+                    : "不适用"
                 }}</span>
               </div>
               <div class="flex items-baseline gap-3">
@@ -742,6 +757,7 @@ const moveDown = async () => {
     v-model:model-id="form.model_id"
     v-model:api-key="form.api_key"
     v-model:middle-route="form.middle_route"
+    v-model:reasoning-effort="form.reasoning_effort"
     v-model:middle-route-enabled="middleRouteEnabled"
     v-model:prompt-cache-enabled="form.prompt_cache_enabled"
     v-model:request-params-enabled="form.request_params_enabled"

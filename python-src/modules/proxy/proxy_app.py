@@ -718,6 +718,19 @@ class ProxyApp:
                 log(f"请求中没有 stream 参数，设置为 {stream_value}")
                 request_data["stream"] = stream_value
 
+        reasoning_effort = (proxy_config.reasoning_effort or "").strip().lower()
+        if reasoning_effort:
+            original_reasoning_effort = request_data.get("reasoning_effort")
+            if original_reasoning_effort != reasoning_effort:
+                if original_reasoning_effort is None:
+                    log(f"请求中没有 reasoning_effort，设置为 {reasoning_effort}")
+                else:
+                    log(
+                        "强制修改思考强度: "
+                        f"{original_reasoning_effort} -> {reasoning_effort}"
+                    )
+            request_data["reasoning_effort"] = reasoning_effort
+
         auth_header = request.headers.get("Authorization")
         if not auth.verify(auth_header):
             log("Chat Completions 请求 MTGA 鉴权失败")

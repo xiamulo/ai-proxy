@@ -225,6 +225,7 @@ def _build_generation_test_proxy_config(config_group: dict[str, Any]) -> ProxyCo
         prompt_cache_bucket_id="",
         api_key=_read_config_str(config_group, "api_key"),
         mtga_auth_key="",
+        reasoning_effort=_read_config_str(config_group, "reasoning_effort") or None,
         model_discovery_strategy=model_discovery_strategy,
     )
 
@@ -253,6 +254,8 @@ def _run_generation_test_with_litellm(
             "max_tokens": 16,
             "stream": True,
         }
+        if proxy_config.reasoning_effort:
+            test_data["reasoning_effort"] = proxy_config.reasoning_effort
         if route.request_params_enabled:
             test_data["temperature"] = 0
         log_func(

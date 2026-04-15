@@ -65,6 +65,96 @@ class DummyAsyncClosableStream:
 
 
 class ProxyAppGeminiTests(unittest.TestCase):
+    def test_proxy_app_injects_reasoning_effort_from_config_group(self) -> None:
+        temp_dir = tempfile.mkdtemp(prefix="mtga-proxy-app-reasoning-")
+        resource_manager = DummyResourceManager(
+            user_data_dir=temp_dir,
+            program_resource_dir=temp_dir,
+        )
+        logs: list[str] = []
+        proxy_config = ProxyConfig(
+            provider=OPENAI_RESPONSE_PROVIDER,
+            target_api_base_url="https://api.openai.com",
+            middle_route="/v1",
+            custom_model_id="mapped-model",
+            target_model_id="gpt-5.4",
+            stream_mode=None,
+            debug_mode=False,
+            disable_ssl_strict_mode=False,
+            api_key="upstream-key",
+            mtga_auth_key="mtga-auth",
+            reasoning_effort="high",
+            websocket_mode_enabled=True,
+        )
+        with patch(
+            "modules.proxy.proxy_app.build_proxy_config",
+            return_value=proxy_config,
+        ):
+            app_layer = ProxyApp(
+                log_func=logs.append,
+                resource_manager=resource_manager,  # type: ignore[arg-type]
+            )
+        self.addCleanup(app_layer.close)
+
+        captured_request_data: dict[str, Any] = {}
+        route = UpstreamRoute(
+            provider=OPENAI_RESPONSE_PROVIDER,
+            request_api=RESPONSES_REQUEST_API,
+            litellm_model="gpt-5.4",
+            base_url="https://api.openai.com/v1",
+            api_key="upstream-key",
+            prompt_cache_enabled=True,
+            request_params_enabled=True,
+            websocket_mode_enabled=True,
+            middle_route_applied=True,
+            middle_route_ignored=False,
+        )
+
+        def fake_create_chat_completion(
+            *,
+            route: UpstreamRoute,
+            request_data: dict[str, Any],
+        ) -> Any:
+            _ = route
+            captured_request_data.update(request_data)
+            return {
+                "id": "chatcmpl_123",
+                "object": "chat.completion",
+                "created": 123,
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+        transport = app_layer.transport
+        with (
+            patch.object(transport.adapter, "build_route", return_value=route),
+            patch.object(
+                transport.adapter,
+                "create_chat_completion",
+                side_effect=fake_create_chat_completion,
+            ),
+        ):
+            client = app_layer.app.test_client()
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer mtga-auth"},
+                json={
+                    "model": "mapped-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_request_data["reasoning_effort"], "high")
+        self.assertTrue(any("设置为 high" in item for item in logs))
+
     def test_mtga_auth_header_is_not_reused_as_upstream_api_key(self) -> None:
         temp_dir = tempfile.mkdtemp(prefix="mtga-proxy-app-auth-boundary-")
         resource_manager = DummyResourceManager(

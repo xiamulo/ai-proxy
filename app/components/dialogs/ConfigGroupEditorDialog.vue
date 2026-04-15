@@ -11,6 +11,7 @@ const props = withDefaults(
     modelId?: string;
     apiKey?: string;
     middleRoute?: string;
+    reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
     middleRouteEnabled?: boolean;
     promptCacheEnabled?: boolean;
     requestParamsEnabled?: boolean;
@@ -30,6 +31,7 @@ const props = withDefaults(
     modelId: "",
     apiKey: "",
     middleRoute: "",
+    reasoningEffort: "high",
     middleRouteEnabled: false,
     promptCacheEnabled: false,
     requestParamsEnabled: true,
@@ -50,6 +52,7 @@ const emit = defineEmits<{
   (event: "update:modelId", value: string): void;
   (event: "update:apiKey", value: string): void;
   (event: "update:middleRoute", value: string): void;
+  (event: "update:reasoningEffort", value: "none" | "low" | "medium" | "high" | "xhigh"): void;
   (event: "update:middleRouteEnabled", value: boolean): void;
   (event: "update:promptCacheEnabled", value: boolean): void;
   (event: "update:requestParamsEnabled", value: boolean): void;
@@ -94,6 +97,12 @@ const middleRouteModel = computed({
   set: (value: string) => emit("update:middleRoute", value),
 });
 
+const reasoningEffortModel = computed({
+  get: () => props.reasoningEffort,
+  set: (value: "none" | "low" | "medium" | "high" | "xhigh") =>
+    emit("update:reasoningEffort", value),
+});
+
 const middleRouteEnabledModel = computed({
   get: () => props.middleRouteEnabled,
   set: (value: boolean) => emit("update:middleRouteEnabled", value),
@@ -120,6 +129,8 @@ const showWebsocketModeOption = computed(
     props.modelId.trim().toLowerCase() === "gpt-5.4",
 );
 
+const showReasoningEffortOption = showWebsocketModeOption;
+
 const handleDialogClose = () => {
   emit("cancel");
 };
@@ -141,6 +152,14 @@ const providerOptions: { label: string; value: ProviderId }[] = [
   { label: "OpenAI Response", value: "openai_response" },
   { label: "Anthropic", value: "anthropic" },
   { label: "Gemini", value: "gemini" },
+];
+
+const reasoningEffortOptions: { label: string; value: string }[] = [
+  { label: "none", value: "none" },
+  { label: "low", value: "low" },
+  { label: "medium", value: "medium" },
+  { label: "high", value: "high" },
+  { label: "xhigh", value: "xhigh" },
 ];
 </script>
 
@@ -255,6 +274,17 @@ const providerOptions: { label: string; value: ProviderId }[] = [
           默认保持和之前一致，会透传 temperature、top_p
           等请求参数；关闭后仅发送基础消息字段，适合旧模型或兼容性较差的上游。
         </p>
+
+        <template v-if="showReasoningEffortOption">
+          <div class="divider my-2 border-slate-700"></div>
+
+          <MtgaSelect
+            v-model="reasoningEffortModel"
+            label="思考强度"
+            :options="reasoningEffortOptions"
+            description="仅对 OpenAI + gpt-5.4 生效。默认 high。"
+          />
+        </template>
 
         <template v-if="showWebsocketModeOption">
           <div class="divider my-2 border-slate-700"></div>

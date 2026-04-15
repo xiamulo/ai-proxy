@@ -40,6 +40,7 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
                 "api_key": "test-key",
                 "middle_route": "/v1beta",
                 "model_discovery_strategy": "gemini_native_bearer",
+                "reasoning_effort": "high",
                 "prompt_cache_enabled": False,
                 "request_params_enabled": False,
                 "websocket_mode_enabled": False,
@@ -56,6 +57,7 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
                 "api_key": "test-key",
                 "middle_route": "/v1beta",
                 "model_discovery_strategy": "gemini_native_bearer",
+                "reasoning_effort": "high",
                 "prompt_cache_enabled": False,
                 "request_params_enabled": False,
                 "websocket_mode_enabled": False,
@@ -77,6 +79,22 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
         self.assertFalse(normalized["prompt_cache_enabled"])
         self.assertTrue(normalized["request_params_enabled"])
         self.assertFalse(normalized["websocket_mode_enabled"])
+
+    def test_normalize_config_group_defaults_reasoning_effort_to_high_for_openai_gpt_5_4(
+        self,
+    ) -> None:
+        normalized = _normalize_config_group(
+            {
+                "provider": "openai_response",
+                "api_url": "https://api.openai.com",
+                "model_id": "gpt-5.4",
+                "api_key": "test-key",
+            }
+        )
+
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized["reasoning_effort"], "high")
 
     def test_normalize_config_group_defaults_websocket_mode_to_false(self) -> None:
         normalized = _normalize_config_group(

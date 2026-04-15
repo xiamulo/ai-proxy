@@ -8,6 +8,7 @@ export type ConfigGroup = {
   api_key: string;
   middle_route?: string;
   model_discovery_strategy?: string;
+  reasoning_effort?: "none" | "low" | "medium" | "high" | "xhigh";
   prompt_cache_enabled?: boolean;
   request_params_enabled?: boolean;
   websocket_mode_enabled?: boolean;

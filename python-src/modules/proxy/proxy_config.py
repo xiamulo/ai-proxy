@@ -55,6 +55,7 @@ class ProxyConfig:
     disable_ssl_strict_mode: bool
     api_key: str
     mtga_auth_key: str
+    reasoning_effort: str | None = None
     model_discovery_strategy: str | None = None
     prompt_cache_bucket_id: str = ""
     prompt_cache_enabled: bool = True
@@ -296,6 +297,11 @@ def build_proxy_config(
         disable_ssl_strict_mode=bool(raw_config.get("disable_ssl_strict_mode", False)),
         api_key=(raw_config.get("api_key") or ""),
         mtga_auth_key=(global_config.get("mtga_auth_key") or ""),
+        reasoning_effort=(
+            raw_config.get("reasoning_effort")
+            if isinstance(raw_config.get("reasoning_effort"), str)
+            else None
+        ),
         model_discovery_strategy=model_discovery_strategy,
         prompt_cache_bucket_id=prompt_cache_bucket_id,
         prompt_cache_enabled=normalize_prompt_cache_enabled(raw_config.get("prompt_cache_enabled")),
