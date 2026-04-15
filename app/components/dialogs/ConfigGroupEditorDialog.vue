@@ -162,7 +162,7 @@ const reasoningEffortOptions: { label: string; value: string }[] = [
 </script>
 
 <template>
-  <MtgaDialog v-model:open="openModel" max-width="max-w-l" @close="handleDialogClose">
+  <MtgaDialog v-model:open="openModel" max-width="max-w-5xl" @close="handleDialogClose">
     <template #header>
       <div class="flex items-center justify-between gap-3">
         <div>

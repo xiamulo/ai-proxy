@@ -60,7 +60,7 @@ const handleEscape = () => {
     @keydown.esc.prevent="handleEscape"
   >
     <div
-      class="mtga-dialog-content my-auto flex max-h-[calc(100dvh-2rem)] w-full min-h-0 flex-col overflow-hidden rounded-2xl bg-slate-950/80 shadow-2xl backdrop-blur-2xl ring-1 ring-cyan-500/20 sm:max-h-[calc(100dvh-3rem)]"
+      class="modal-box mtga-dialog-content relative my-auto flex h-auto max-h-[calc(100dvh-2rem)] w-full min-h-0 flex-col overflow-hidden rounded-2xl border-0 bg-slate-950/80 p-0 shadow-2xl backdrop-blur-2xl ring-1 ring-cyan-500/20 sm:max-h-[calc(100dvh-3rem)]"
       :class="[props.maxWidth, props.open ? 'scale-100 opacity-100' : 'scale-95 opacity-0']"
       @click.stop
     >
