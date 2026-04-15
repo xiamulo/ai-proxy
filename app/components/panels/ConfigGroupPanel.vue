@@ -332,7 +332,7 @@ const handleSave = async () => {
     api_url: normalizeApiUrl(form.api_url),
     model_id: form.model_id.trim(),
     api_key: form.api_key.trim(),
-    reasoning_effort: isGpt54OpenAiForm.value ? form.reasoning_effort : undefined,
+    reasoning_effort: form.reasoning_effort,
     prompt_cache_enabled: form.prompt_cache_enabled,
     request_params_enabled: form.request_params_enabled,
     websocket_mode_enabled: isGpt54OpenAiForm.value ? form.websocket_mode_enabled : false,
@@ -699,13 +699,11 @@ const moveDown = async () => {
               <div class="flex items-baseline gap-3">
                 <span class="shrink-0 text-xs font-medium text-slate-500 w-16">思考强度</span>
                 <span class="text-sm text-slate-300">{{
-                  isGpt54OpenAiGroup(configGroups[selectedIndex]!)
-                    ? configGroups[selectedIndex]?.reasoning_effort || "high"
-                    : "不适用"
+                  configGroups[selectedIndex]?.reasoning_effort || "high"
                 }}</span>
               </div>
               <div class="flex items-baseline gap-3">
-                <span class="shrink-0 text-xs font-medium text-slate-500 w-16">提示缓存</span>
+                <span class="shrink-0 text-xs font-medium text-slate-500 w-16">提示缓存2</span>
                 <span class="text-sm text-slate-300">{{
                   configGroups[selectedIndex]?.prompt_cache_enabled ? "已启用" : "未启用"
                 }}</span>

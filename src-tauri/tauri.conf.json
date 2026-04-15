@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "ai-proxy",
-  "version": "2.8.0-beta.12",
+  "version": "2.8.0-beta.13",
   "identifier": "com.aiproxy.tauri",
   "build": {
     "frontendDist": "../dist",

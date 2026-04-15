@@ -14,7 +14,12 @@ from typing import Any, cast
 from flask import Flask, Response, jsonify, request
 
 from modules.proxy.proxy_auth import ProxyAuth
-from modules.proxy.proxy_config import DEFAULT_MIDDLE_ROUTE, ProxyConfig, build_proxy_config
+from modules.proxy.proxy_config import (
+    DEFAULT_MIDDLE_ROUTE,
+    OPENAI_RESPONSES_WEBSOCKET_MODEL_ID,
+    ProxyConfig,
+    build_proxy_config,
+)
 from modules.proxy.proxy_transport import ProxyTransport
 from modules.proxy.upstream_adapter import (
     RESPONSES_REQUEST_API,
@@ -719,7 +724,10 @@ class ProxyApp:
                 request_data["stream"] = stream_value
 
         reasoning_effort = (proxy_config.reasoning_effort or "").strip().lower()
-        if reasoning_effort:
+        is_gpt_54 = (
+            target_model_id.strip().lower() == OPENAI_RESPONSES_WEBSOCKET_MODEL_ID
+        )
+        if reasoning_effort and is_gpt_54:
             original_reasoning_effort = request_data.get("reasoning_effort")
             if original_reasoning_effort != reasoning_effort:
                 if original_reasoning_effort is None:

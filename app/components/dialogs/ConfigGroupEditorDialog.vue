@@ -129,8 +129,6 @@ const showWebsocketModeOption = computed(
     props.modelId.trim().toLowerCase() === "gpt-5.4",
 );
 
-const showReasoningEffortOption = showWebsocketModeOption;
-
 const handleDialogClose = () => {
   emit("cancel");
 };
@@ -240,14 +238,24 @@ const reasoningEffortOptions: { label: string; value: string }[] = [
 
       <!-- 模型 ID 与自动发现 -->
       <div class="space-y-2 rounded-2xl border border-slate-700 bg-slate-900/50 px-4 py-3">
-        <label class="flex cursor-pointer items-center gap-2">
-          <input
-            v-model="promptCacheEnabledModel"
-            type="checkbox"
-            class="toggle toggle-xs toggle-info"
-          />
-          <span class="label-text text-sm font-medium text-slate-300">提示缓存</span>
-        </label>
+        <div class="flex items-start justify-between gap-3">
+          <label class="flex cursor-pointer items-center gap-2 pt-2">
+            <input
+              v-model="promptCacheEnabledModel"
+              type="checkbox"
+              class="toggle toggle-xs toggle-info"
+            />
+            <span class="label-text text-sm font-medium text-slate-300">提示缓存2</span>
+          </label>
+          <div class="w-40 shrink-0">
+            <MtgaSelect
+              v-model="reasoningEffortModel"
+              label="思考强度"
+              :options="reasoningEffortOptions"
+              size="sm"
+            />
+          </div>
+        </div>
         <div class="text-[11px] leading-5 text-slate-500">
           当客户端请求列出所有可用模型时，代理应当如何处理。
         </div>
@@ -274,17 +282,9 @@ const reasoningEffortOptions: { label: string; value: string }[] = [
           默认保持和之前一致，会透传 temperature、top_p
           等请求参数；关闭后仅发送基础消息字段，适合旧模型或兼容性较差的上游。
         </p>
-
-        <template v-if="showReasoningEffortOption">
-          <div class="divider my-2 border-slate-700"></div>
-
-          <MtgaSelect
-            v-model="reasoningEffortModel"
-            label="思考强度"
-            :options="reasoningEffortOptions"
-            description="仅对 OpenAI + gpt-5.4 生效。默认 high。"
-          />
-        </template>
+        <p class="text-xs leading-5 text-slate-400">
+          思考强度下拉框始终显示，但只有 `OpenAI + gpt-5.4` 会把该参数真正带到上游请求里。
+        </p>
 
         <template v-if="showWebsocketModeOption">
           <div class="divider my-2 border-slate-700"></div>

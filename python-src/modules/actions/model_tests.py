@@ -12,6 +12,7 @@ from modules.proxy.proxy_config import (
     GEMINI_NATIVE_BEARER_MODEL_DISCOVERY,
     GEMINI_NATIVE_X_GOOG_API_KEY_MODEL_DISCOVERY,
     GEMINI_PROVIDER,
+    OPENAI_RESPONSES_WEBSOCKET_MODEL_ID,
     ProxyConfig,
     normalize_middle_route,
     normalize_provider,
@@ -254,7 +255,10 @@ def _run_generation_test_with_litellm(
             "max_tokens": 16,
             "stream": True,
         }
-        if proxy_config.reasoning_effort:
+        if (
+            proxy_config.reasoning_effort
+            and model_id.strip().lower() == OPENAI_RESPONSES_WEBSOCKET_MODEL_ID
+        ):
             test_data["reasoning_effort"] = proxy_config.reasoning_effort
         if route.request_params_enabled:
             test_data["temperature"] = 0
