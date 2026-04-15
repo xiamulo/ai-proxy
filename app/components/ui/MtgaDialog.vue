@@ -54,15 +54,19 @@ const handleEscape = () => {
 </script>
 
 <template>
-  <dialog class="modal" :class="{ 'modal-open': props.open }" @keydown.esc.prevent="handleEscape">
+  <dialog
+    class="modal px-3 py-4 sm:px-4 sm:py-6"
+    :class="{ 'modal-open': props.open }"
+    @keydown.esc.prevent="handleEscape"
+  >
     <div
-      class="mtga-dialog-content flex max-h-[90vh] w-full flex-col overflow-hidden rounded-2xl bg-slate-950/80 shadow-2xl backdrop-blur-2xl ring-1 ring-cyan-500/20"
+      class="mtga-dialog-content my-auto flex max-h-[calc(100dvh-2rem)] w-full min-h-0 flex-col overflow-hidden rounded-2xl bg-slate-950/80 shadow-2xl backdrop-blur-2xl ring-1 ring-cyan-500/20 sm:max-h-[calc(100dvh-3rem)]"
       :class="[props.maxWidth, props.open ? 'scale-100 opacity-100' : 'scale-95 opacity-0']"
       @click.stop
     >
-      <div class="mtga-card-body p-0 flex flex-col">
+      <div class="mtga-card-body flex min-h-0 flex-1 flex-col p-0">
         <!-- 头部插槽：统一由基础组件提供底部分割线 -->
-        <div v-if="$slots.header" class="px-6 py-5 border-b border-slate-700/60">
+        <div v-if="$slots.header" class="shrink-0 border-b border-slate-700/60 px-6 py-5">
           <slot name="header"></slot>
         </div>
 
@@ -74,7 +78,7 @@ const handleEscape = () => {
         <!-- 底部插槽：操作按钮区 -->
         <div
           v-if="$slots.footer"
-          class="flex items-center justify-end gap-3 border-t border-slate-700/60 bg-slate-900/50 px-6 py-4"
+          class="sticky bottom-0 z-10 flex shrink-0 items-center justify-end gap-3 border-t border-slate-700/60 bg-slate-900/95 px-6 py-4 backdrop-blur-xl"
         >
           <slot name="footer"></slot>
         </div>
